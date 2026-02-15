@@ -43,6 +43,19 @@ def ds_union_by_rank(disjoint_set, x, y):
 
 
 @numba.njit(cache=NUMBA_CACHE)
+def ds_find_readonly(parent, x):
+    """Find root of x WITHOUT path compression (safe for parallel reads).
+
+    Unlike ds_find, this operates on a raw parent array (not a DisjointSet
+    namedtuple) and never writes to the array, making it safe for use inside
+    numba.prange loops where multiple threads read concurrently.
+    """
+    while parent[x] != x:
+        x = parent[x]
+    return x
+
+
+@numba.njit(cache=NUMBA_CACHE)
 def ds_union_by_size(disjoint_set, x, y):
     x = ds_find(disjoint_set, x)
     y = ds_find(disjoint_set, y)
