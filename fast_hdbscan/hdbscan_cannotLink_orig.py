@@ -465,6 +465,8 @@ def _constrained_kruskal_mst_csr_strict_sorted_numba(
 
     mst_edges = np.empty((n_points - 1, 3), dtype=np.float64)
     n_added = 0
+    n_direct_skips = np.int64(0)
+    n_component_skips = np.int64(0)
 
     for idx_edge in range(u_sorted.shape[0]):
         a = int(u_sorted[idx_edge])
@@ -477,6 +479,7 @@ def _constrained_kruskal_mst_csr_strict_sorted_numba(
         if _csr_row_contains_numba(
             cannot_link_indptr, cannot_link_indices, a, b
         ) or _csr_row_contains_numba(cannot_link_indptr, cannot_link_indices, b, a):
+            n_direct_skips += np.int64(1)
             continue
 
         ra = _dsu_find_numba(parent, a)
@@ -501,6 +504,7 @@ def _constrained_kruskal_mst_csr_strict_sorted_numba(
             cannot_link_indptr,
             cannot_link_indices,
         ):
+            n_component_skips += np.int64(1)
             continue
 
         # Union: attach small -> large
@@ -520,7 +524,7 @@ def _constrained_kruskal_mst_csr_strict_sorted_numba(
         if n_added == n_points - 1:
             break
 
-    return mst_edges[:n_added]
+    return (mst_edges[:n_added], n_direct_skips, n_component_skips)
 
 
 def _ensure_csr_distance_matrix(distances: Union[np.ndarray, CSR]) -> CSR:
@@ -855,7 +859,7 @@ def _kruskal_mst_constrained_hard(
             "merge_constraint.cannot_link_indptr must have shape (N+1,) for strict=True."
         )
 
-    mst_edges = _constrained_kruskal_mst_csr_strict_sorted_numba(
+    mst_edges, n_direct_skips, n_component_skips = _constrained_kruskal_mst_csr_strict_sorted_numba(
         u_sorted,
         v_sorted,
         w_sorted,
@@ -864,7 +868,7 @@ def _kruskal_mst_constrained_hard(
         int(n_points),
     )
 
-    return mst_edges
+    return mst_edges, n_direct_skips, n_component_skips
 
 
 def _choose_large_finite_penalty(
@@ -1263,6 +1267,7 @@ def fast_hdbscan_precomputed_with_merge_constraint(
     cluster_selection_persistence: float = 0.0,
     sample_weights: Optional[np.ndarray] = None,
     return_trees: bool = False,
+    return_metadata: bool = False,
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Optional[object], Optional[np.ndarray]
 ]:
@@ -1325,8 +1330,11 @@ def fast_hdbscan_precomputed_with_merge_constraint(
         distance_matrix_csr, core_distances=core_distances
     )
 
+    _n_direct_skips = 0
+    _n_component_skips = 0
+
     if bool(strict):
-        mst_edges = _kruskal_mst_constrained_hard(
+        mst_edges, _n_direct_skips, _n_component_skips = _kruskal_mst_constrained_hard(
             n_points=n_points,
             u=u,
             v=v,
@@ -1383,6 +1391,16 @@ def fast_hdbscan_precomputed_with_merge_constraint(
         )
         results = (labels_clean, results[1], *results[2:])
 
+    if bool(return_metadata):
+        metadata = {
+            "n_rounds": 1,
+            "violations_detected_mst": int(_n_direct_skips) + int(_n_component_skips),
+            "n_direct_skips": int(_n_direct_skips),
+            "n_component_skips": int(_n_component_skips),
+        }
+        base = results[: (None if return_trees else 2)]
+        return (*base, metadata)
+
     return results[: (None if return_trees else 2)]
 
 
@@ -1402,6 +1420,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
     cluster_selection_persistence: float = 0.0,
     sample_weights: Optional[np.ndarray] = None,
     return_trees: bool = False,
+    return_metadata: bool = False,
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Optional[object], Optional[np.ndarray]
 ]:
@@ -1451,6 +1470,7 @@ def fast_hdbscan_precomputed_with_cannot_link(
         cluster_selection_persistence=float(cluster_selection_persistence),
         sample_weights=sample_weights,
         return_trees=bool(return_trees),
+        return_metadata=bool(return_metadata),
     )
 
 

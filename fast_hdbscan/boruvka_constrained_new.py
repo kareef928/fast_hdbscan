@@ -1020,6 +1020,8 @@ def parallel_boruvka(
 
     # ---- fix violations from the KNN initialisation round ----
     all_edges = initial_edges
+    round_number = np.int64(0)
+    total_violations_removed = np.int64(0)
 
     if cl_indptr.shape[0] > 1 and all_edges.shape[0] > 0:
         n_init = all_edges.shape[0]
@@ -1039,7 +1041,7 @@ def parallel_boruvka(
             all_edges,
             n_init_out,
             _removed,
-            _n_rem,
+            _n_rem_init,
         ) = fix_violations(
             n_points,
             all_edges,
@@ -1063,6 +1065,7 @@ def parallel_boruvka(
             next_node[_i] = next_out[_i]
 
         all_edges = all_edges[:n_init_out]
+        total_violations_removed += np.int64(_n_rem_init)
 
         # Refresh component vectors after potential splits
         update_component_vectors(
@@ -1072,6 +1075,7 @@ def parallel_boruvka(
     n_components = len(np.unique(point_components))
 
     while n_components > 1:
+        round_number += np.int64(1)
         # -- Step 1: find cheapest cross-component edges via KD-tree --
         if reproducible:
             block_size = calculate_block_size(
@@ -1130,7 +1134,7 @@ def parallel_boruvka(
                 combined,
                 n_added_out,
                 _removed_edges,
-                _n_removed,
+                _n_removed_round,
             ) = fix_violations(
                 n_points,
                 combined,
@@ -1146,6 +1150,7 @@ def parallel_boruvka(
                 tail,
                 next_node,
             )
+            total_violations_removed += np.int64(_n_removed_round)
 
             # Update linked-list arrays
             for i in range(n_points):
@@ -1178,4 +1183,149 @@ def parallel_boruvka(
         n_components = len(np.unique(point_components))
 
     all_edges[:, 2] = np.sqrt(all_edges.T[2])
-    return all_edges, neighbors[:, 1:], np.sqrt(core_distances)
+    return all_edges, neighbors[:, 1:], np.sqrt(core_distances), round_number, total_violations_removed
+
+
+# =====================================================================
+# High-level wrapper: Borůvka MST → HDBSCAN labels with posthoc cleanup
+# =====================================================================
+
+
+def _pad_spanning_forest(edges, n_points):
+    """Pad a spanning forest into a full spanning tree (n-1 edges).
+
+    Disconnected components are bridged with ``np.inf``-weight sentinel
+    edges so that ``clusters_from_spanning_tree`` sizes its internal
+    arrays correctly.  The infinite weight ensures these bridges are cut
+    first during condensation.
+    """
+    n_edges = edges.shape[0]
+    needed = n_points - 1
+    if n_edges >= needed:
+        return edges
+
+    parent = np.arange(n_points)
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n_edges):
+        _union(int(edges[i, 0]), int(edges[i, 1]))
+
+    roots = sorted({_find(i) for i in range(n_points)})
+    bridges = []
+    for k in range(1, len(roots)):
+        bridges.append([float(roots[0]), float(roots[k]), np.inf])
+
+    if bridges:
+        edges = np.vstack([edges, np.array(bridges, dtype=edges.dtype)])
+    return edges
+
+
+def constrained_hdbscan_from_boruvka(
+    tree,
+    n_threads,
+    cl_indptr,
+    cl_indices,
+    *,
+    min_samples=10,
+    min_cluster_size=10,
+    posthoc_cleanup=True,
+    sample_weights=None,
+    reproducible=False,
+    return_metadata=False,
+):
+    """Run constrained Borůvka MST → HDBSCAN labels, with optional
+    post-hoc cleanup to guarantee zero cannot-link violations.
+
+    Parameters
+    ----------
+    tree : NumbaKDTree
+        Pre-built KD-tree.
+    n_threads : int
+        Number of Numba threads.
+    cl_indptr, cl_indices : ndarray
+        CSR-format cannot-link constraint graph.
+    min_samples, min_cluster_size : int
+        HDBSCAN parameters.
+    posthoc_cleanup : bool
+        If True, split any cluster that still violates a cannot-link
+        constraint after the standard HDBSCAN label extraction.
+    sample_weights : ndarray or None
+    reproducible : bool
+    return_metadata : bool
+        If True, return a fourth element: a dict with
+        ``n_rounds`` and ``violations_detected_mst``.
+
+    Returns
+    -------
+    labels : ndarray (n_points,) int64
+    probs  : ndarray (n_points,) float64
+    edges  : ndarray (n_edges, 3) float64 – the (padded) MST
+    metadata : dict (only when *return_metadata* is True)
+    """
+    from .hdbscan import clusters_from_spanning_tree
+
+    n_points = tree.data.shape[0]
+
+    edges, nbrs, core_dists, n_rounds, n_viols = parallel_boruvka(
+        tree, n_threads,
+        min_samples=min_samples,
+        sample_weights=sample_weights,
+        reproducible=reproducible,
+        cl_indptr=cl_indptr,
+        cl_indices=cl_indices,
+    )
+
+    edges = _pad_spanning_forest(edges, n_points)
+
+    # Replace inf with large finite penalty (same logic as hdbscan_cannotLink_orig)
+    finite_vals = edges[:, 2][np.isfinite(edges[:, 2])]
+    if finite_vals.size > 0:
+        penalty = float(np.percentile(finite_vals, 99.9) * 1e6 + 1.0)
+    else:
+        penalty = 1e6
+    bad = ~np.isfinite(edges[:, 2])
+    if np.any(bad):
+        edges = edges.copy()
+        edges[bad, 2] = penalty
+
+    labels, probs, *_ = clusters_from_spanning_tree(
+        edges, min_cluster_size=min_cluster_size,
+    )
+
+    if posthoc_cleanup and cl_indptr.shape[0] > 1:
+        from .hdbscan_cannotLink_orig import (
+            MergeConstraint,
+            _maybe_split_labels_if_cannot_link_violated,
+        )
+        # Rebuild dense constraint matrix from CSR arrays
+        constraint_matrix = np.zeros((n_points, n_points), dtype=bool)
+        for row in range(n_points):
+            for k in range(cl_indptr[row], cl_indptr[row + 1]):
+                col = int(cl_indices[k])
+                constraint_matrix[row, col] = True
+                constraint_matrix[col, row] = True
+
+        mc = MergeConstraint.from_cannot_link_matrix(
+            constraint_matrix, n_points=n_points,
+        )
+        labels = _maybe_split_labels_if_cannot_link_violated(
+            labels, merge_constraint=mc, distances=None, noise_label=-1,
+        )
+
+    if return_metadata:
+        metadata = {
+            "n_rounds": int(n_rounds),
+            "violations_detected_mst": int(n_viols),
+        }
+        return labels, probs, edges, metadata
+    return labels, probs, edges
