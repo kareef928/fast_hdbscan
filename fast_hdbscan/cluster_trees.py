@@ -7,7 +7,7 @@ from .variables import NUMBA_CACHE
 from .disjoint_set import ds_rank_create, ds_find, ds_union_by_rank
 
 from numba.typed import Dict, List
-from numba.types import int64, ListType
+from numba.types import int64, ListType, boolean
 
 int64_list_type = ListType(int64)
 
@@ -385,20 +385,22 @@ def cluster_tree_from_condensed_tree_bcubed(
 ):
     # This functions returns a cluster_tree with virtual nodes (if applicable).
 
-    label_indices_list = list(label_indices.keys())
-    cluster_tree_parents = list(cluster_tree.parent)
+    # A labeled node that has no children and whose parent is not a leaf cluster,
+    # then it must be represented as a noisy (virtual) node.
+    cluster_tree_parent_lookup = Dict.empty(key_type=int64, value_type=boolean)
+    for i in range(cluster_tree.parent.shape[0]):
+        cluster_tree_parent_lookup[cluster_tree.parent[i]] = True
 
-    # A labeled node that has no children and who's parent is not a leaf cluster, then it must be
-    # a noisy node (virtual node).
-
-    mask1 = condensed_tree.child_size > 1
-    mask2 = condensed_tree.child_size == 1
-    mask3 = np.array([child in label_indices_list for child in condensed_tree.child])
-    mask4 = np.array(
-        [parent in cluster_tree_parents for parent in condensed_tree.parent]
-    )  # check that it's not a leaf cluster
-
-    mask = mask1 | (mask2 & mask3 & mask4)
+    n_edges = condensed_tree.child.shape[0]
+    mask = np.zeros(n_edges, dtype=np.bool_)
+    for i in range(n_edges):
+        child_size = condensed_tree.child_size[i]
+        if child_size > 1:
+            mask[i] = True
+        elif child_size == 1:
+            child = condensed_tree.child[i]
+            parent = condensed_tree.parent[i]
+            mask[i] = (child in label_indices) and (parent in cluster_tree_parent_lookup)
 
     return CondensedTree(
         condensed_tree.parent[mask],
@@ -409,13 +411,7 @@ def cluster_tree_from_condensed_tree_bcubed(
 
 
 @numba.njit(cache=NUMBA_CACHE)
-def get_condensed_tree_clusters_bcubed(
-    condensed_tree,
-    label_indices,
-    cluster_tree=None,
-    cluster_tree_bcubed=None,
-    allow_virtual_nodes=False,
-):
+def get_condensed_tree_clusters_bcubed(condensed_tree, label_indices):
 
     cluster_elements = Dict.empty(
         key_type=int64,
@@ -423,9 +419,11 @@ def get_condensed_tree_clusters_bcubed(
     )
 
     virtual_nodes = [0 for x in range(0)]
-    labeled_points = set(label_indices.keys())
 
-    parents_set = set(list(condensed_tree.parent))
+    parents_set = Dict.empty(key_type=int64, value_type=boolean)
+    for i in range(condensed_tree.parent.shape[0]):
+        parents_set[condensed_tree.parent[i]] = True
+
     for i in range(len(condensed_tree.child) - 1, -1, -1):  # Traverse tree bottom up
         parent = condensed_tree.parent[i]
         child = condensed_tree.child[i]
@@ -433,26 +431,35 @@ def get_condensed_tree_clusters_bcubed(
             if parent in cluster_elements:
                 cluster_elements[parent].extend(cluster_elements[child])
             else:
-                cluster_labeled_points = list(
-                    set(cluster_elements[child]) & labeled_points
-                )
-                cluster_elements[parent] = List(cluster_labeled_points)
+                cluster_labeled_points = List.empty_list(int64)
+                for point in cluster_elements[child]:
+                    if point in label_indices:
+                        cluster_labeled_points.append(point)
+                cluster_elements[parent] = cluster_labeled_points
         elif parent in cluster_elements:
-            if child in labeled_points:
+            if child in label_indices:
                 cluster_elements[parent].append(child)
         else:
             cluster_elements[parent] = List.empty_list(int64)
-            if child in labeled_points:
+            if child in label_indices:
                 cluster_elements[parent].append(child)
 
-    if (
-        allow_virtual_nodes
-        and (cluster_tree is not None)
-        and (cluster_tree_bcubed is not None)
-    ):
-        for node in list(
-            set(cluster_tree_bcubed.child).difference(set(cluster_tree.child))
-        ):
+    return cluster_elements, np.array(virtual_nodes)
+
+
+@numba.njit(cache=NUMBA_CACHE)
+def add_virtual_tree_nodes_bcubed(cluster_elements, cluster_tree, cluster_tree_bcubed):
+    virtual_nodes = [0 for x in range(0)]
+    cluster_tree_children = Dict.empty(key_type=int64, value_type=boolean)
+    for i in range(cluster_tree.child.shape[0]):
+        cluster_tree_children[cluster_tree.child[i]] = True
+
+    seen_virtual_nodes = Dict.empty(key_type=int64, value_type=boolean)
+
+    for i in range(cluster_tree_bcubed.child.shape[0]):
+        node = cluster_tree_bcubed.child[i]
+        if (node not in cluster_tree_children) and (node not in seen_virtual_nodes):
+            seen_virtual_nodes[node] = True
             virtual_nodes.append(node)
             cluster_elements[node] = List.empty_list(int64)
             cluster_elements[node].append(node)
@@ -588,12 +595,13 @@ def extract_clusters_bcubed(
         cluster_tree_bcubed = cluster_tree_from_condensed_tree_bcubed(
             condensed_tree, cluster_tree, label_indices
         )
-        cluster_elements, virtual_nodes = get_condensed_tree_clusters_bcubed(
-            condensed_tree,
-            label_indices,
+        cluster_elements, _ = get_condensed_tree_clusters_bcubed(
+            condensed_tree, label_indices
+        )
+        cluster_elements, virtual_nodes = add_virtual_tree_nodes_bcubed(
+            cluster_elements,
             cluster_tree,
             cluster_tree_bcubed,
-            allow_virtual_nodes,
         )
         stability_node_scores = score_condensed_tree_nodes(condensed_tree)
         for node in virtual_nodes:
