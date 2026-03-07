@@ -155,6 +155,10 @@ def fast_hdbscan(
     reproducible=False,
     return_trees=False,
     metric="euclidean",
+    algorithm="boruvka",
+    knn_k=None,
+    cannot_link=None,
+    validate_cannot_link=True,
 ):
     if metric == "precomputed":
         if sample_weights is not None:
@@ -207,6 +211,10 @@ def fast_hdbscan(
         sample_weights=sample_weights,
         reproducible=reproducible,
         metric=metric,
+        algorithm=algorithm,
+        knn_k=knn_k,
+        cannot_link=cannot_link,
+        validate_cannot_link=validate_cannot_link,
     )
 
     return (
@@ -229,7 +237,15 @@ def fast_hdbscan(
 
 
 def compute_minimum_spanning_tree(
-    data, min_samples=10, sample_weights=None, reproducible=False, metric="euclidean"
+    data,
+    min_samples=10,
+    sample_weights=None,
+    reproducible=False,
+    metric="euclidean",
+    algorithm="boruvka",
+    knn_k=None,
+    cannot_link=None,
+    validate_cannot_link=True,
 ):
     """
     Compute the minimum spanning tree for HDBSCAN.
@@ -245,26 +261,78 @@ def compute_minimum_spanning_tree(
     reproducible : bool
     metric : str
         'euclidean' (default) or 'precomputed'.
+    algorithm : str
+        MST algorithm to use: 'boruvka' (default) or 'kruskal'.
+        - 'boruvka' : parallel Borůvka via KD-tree for euclidean; Borůvka on
+          CoreGraph (float32) for precomputed.
+        - 'kruskal' : Kruskal DSU on KNN graph for euclidean; Kruskal DSU on
+          full CSR edge list (float64) for precomputed.
+    knn_k : int or None
+        Only used when algorithm='kruskal' and metric='euclidean'.
+        - None : exact MST via full pairwise distances (O(n^2) memory).
+        - int  : approximate MST via KNN subgraph with this many neighbors.
+    cannot_link : scipy sparse matrix or None
+        Symmetric sparse matrix of cannot-link constraints.  Only supported
+        with algorithm='kruskal'.
+    validate_cannot_link : bool
+        If True (default), validate and symmetrize the cannot-link matrix
+        (handles upper-triangle-only and lower-triangle-only inputs).
+        Set to False to skip validation when you know the input is already
+        a symmetric CSR matrix — avoids an O(nnz) symmetrization step.
     """
+    if algorithm not in ("boruvka", "kruskal"):
+        raise ValueError(
+            "algorithm must be 'boruvka' or 'kruskal'. Got: %s" % algorithm
+        )
+
+    if cannot_link is not None and algorithm != "kruskal":
+        raise ValueError(
+            "cannot_link constraints are only supported with "
+            "algorithm='kruskal'. Got algorithm=%r." % algorithm
+        )
+
     if metric == "precomputed":
         if sample_weights is not None:
             raise NotImplementedError(
                 "sample_weights is not supported with metric='precomputed'."
             )
-        from .precomputed import compute_mst_from_precomputed_sparse
+        if algorithm == "kruskal":
+            from .precomputed import compute_mst_from_precomputed_sparse_kruskal
 
-        return compute_mst_from_precomputed_sparse(data, min_samples)
+            return compute_mst_from_precomputed_sparse_kruskal(
+                data, min_samples, cannot_link=cannot_link,
+                validate_cannot_link=validate_cannot_link,
+            )
+        else:
+            from .precomputed import compute_mst_from_precomputed_sparse
 
-    n_threads = numba.get_num_threads()
+            return compute_mst_from_precomputed_sparse(data, min_samples)
+
+    # metric == "euclidean"
     numba_tree = build_kdtree(data)
-    edges, neighbors, core_distances = parallel_boruvka(
-        numba_tree,
-        n_threads,
-        min_samples=min_samples,
-        sample_weights=sample_weights,
-        reproducible=reproducible,
-    )
-    return edges, neighbors, core_distances
+
+    if algorithm == "kruskal":
+        from .kruskal import kruskal_mst_from_feature_matrix
+
+        return kruskal_mst_from_feature_matrix(
+            numba_tree,
+            min_samples,
+            knn_k=knn_k,
+            sample_weights=sample_weights,
+            reproducible=reproducible,
+            cannot_link=cannot_link,
+            validate_cannot_link=validate_cannot_link,
+        )
+    else:
+        n_threads = numba.get_num_threads()
+        edges, neighbors, core_distances = parallel_boruvka(
+            numba_tree,
+            n_threads,
+            min_samples=min_samples,
+            sample_weights=sample_weights,
+            reproducible=reproducible,
+        )
+        return edges, neighbors, core_distances
 
 
 def clusters_from_spanning_tree(
@@ -362,6 +430,10 @@ class HDBSCAN(ClusterMixin, BaseEstimator):
         ss_algorithm="bc",
         reproducible=False,
         metric="euclidean",
+        algorithm="boruvka",
+        knn_k=None,
+        cannot_link=None,
+        validate_cannot_link=True,
         # Removed **kwargs to comply with scikit-learn's API requirements
     ):
         self.min_cluster_size = min_cluster_size
@@ -375,6 +447,10 @@ class HDBSCAN(ClusterMixin, BaseEstimator):
         self.ss_algorithm = ss_algorithm
         self.reproducible = reproducible
         self.metric = metric
+        self.algorithm = algorithm
+        self.knn_k = knn_k
+        self.cannot_link = cannot_link
+        self.validate_cannot_link = validate_cannot_link
 
     def fit(self, X, y=None, sample_weight=None, **fit_params):
 
