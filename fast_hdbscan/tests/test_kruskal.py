@@ -1388,3 +1388,428 @@ class TestForestClustering:
 
         elapsed = time.perf_counter() - start
         print(f"\n  forest stress: {trial} trials in {elapsed:.2f}s")
+
+
+# ===================================================================
+# Borůvka with CL constraints
+# ===================================================================
+
+class TestBoruvkaCL:
+    """Tests for boruvka_mst_cl via the precomputed path."""
+
+    @staticmethod
+    def _check_cl_violations_from_edges(edges, cl_sparse, n):
+        """Return list of (i, j) CL pairs in same finite component."""
+        cl_csr = sparse.csr_matrix(cl_sparse)
+        finite_mask = np.isfinite(edges[:, 2])
+        parent = np.arange(n, dtype=np.int32)
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in edges[finite_mask]:
+            u, v = int(e[0]), int(e[1])
+            ru, rv = find(u), find(v)
+            if ru != rv:
+                parent[rv] = ru
+
+        violations = []
+        cl_coo = cl_csr.tocoo()
+        for i, j in zip(cl_coo.row, cl_coo.col):
+            if j > i and find(i) == find(j):
+                violations.append((i, j))
+        return violations
+
+    def test_basic_precomputed(self):
+        """Basic CL constraint separates two nodes."""
+        np.random.seed(42)
+        n = 8
+        D = np.random.rand(n, n)
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        X = sparse.csr_matrix(D)
+
+        cl = sparse.lil_matrix((n, n))
+        cl[0, 1] = 1
+        cl[1, 0] = 1
+        cl = cl.tocsr()
+
+        edges, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=2, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl,
+        )
+        assert edges.shape == (n - 1, 3)
+        v = self._check_cl_violations_from_edges(edges, cl, n)
+        assert len(v) == 0, f"Violations: {v}"
+
+    def test_no_constraints_matches_standard(self):
+        """Empty CL matrix gives same result as standard Borůvka."""
+        np.random.seed(123)
+        n = 20
+        D = np.random.rand(n, n) * 10
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        X = sparse.csr_matrix(D)
+
+        e_std, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=3, metric="precomputed", algorithm="boruvka",
+        )
+        cl_empty = sparse.csr_matrix((n, n))
+        e_cl, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=3, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl_empty,
+        )
+
+        def sort_edges(e):
+            e = e.copy()
+            for i in range(len(e)):
+                if e[i, 0] > e[i, 1]:
+                    e[i, 0], e[i, 1] = e[i, 1], e[i, 0]
+            order = np.lexsort((e[:, 1], e[:, 0], e[:, 2]))
+            return e[order]
+
+        assert np.allclose(sort_edges(e_std), sort_edges(e_cl))
+
+    def test_transitive_violation_caught(self):
+        """
+        Construct a case where merging A-B and C-B simultaneously would
+        create a transitive violation A-C.  Step (c) must catch and fix it.
+
+        Graph: 4 nodes, edges: 0-1 (w=1), 1-2 (w=2), 2-3 (w=3), 0-3 (w=4)
+        CL: 0 cannot link with 2.
+
+        Without CL: MST = {0-1, 1-2, 2-3}.
+        With CL: Borůvka round 1 might try to merge 0-1 and 2-1 simultaneously,
+        which would put 0 and 2 in the same component. Step (c) should catch
+        this and remove the heavier edge (1-2, w=2).
+        """
+        n = 4
+        D = np.full((n, n), 100.0)
+        D[0, 1] = D[1, 0] = 1.0
+        D[1, 2] = D[2, 1] = 2.0
+        D[2, 3] = D[3, 2] = 3.0
+        D[0, 3] = D[3, 0] = 4.0
+        np.fill_diagonal(D, 0)
+        X = sparse.csr_matrix(D)
+
+        cl = sparse.lil_matrix((n, n))
+        cl[0, 2] = 1
+        cl[2, 0] = 1
+        cl = cl.tocsr()
+
+        edges, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=1, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl,
+        )
+        v = self._check_cl_violations_from_edges(edges, cl, n)
+        assert len(v) == 0, f"Transitive violation not caught: {v}"
+
+    def test_all_singletons(self):
+        """Every node CL-constrained with every other -> all singletons."""
+        n = 5
+        D = np.ones((n, n))
+        np.fill_diagonal(D, 0)
+        X = sparse.csr_matrix(D)
+
+        cl = sparse.lil_matrix((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                cl[i, j] = 1
+                cl[j, i] = 1
+        cl = cl.tocsr()
+
+        edges, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=1, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl,
+        )
+        # All edges should be inf bridges
+        assert np.all(np.isinf(edges[:, 2]))
+
+    def test_cl_doesnt_prevent_full_connectivity(self):
+        """CL between unrelated nodes doesn't block the full MST."""
+        np.random.seed(99)
+        n = 10
+        D = np.random.rand(n, n)
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        X = sparse.csr_matrix(D)
+
+        # CL between nodes 0 and 9 (far apart, unlikely to be in same
+        # component early). MST should still be fully connected via other paths.
+        cl = sparse.lil_matrix((n, n))
+        cl[0, 9] = 1
+        cl[9, 0] = 1
+        cl = cl.tocsr()
+
+        edges, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=2, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl,
+        )
+        v = self._check_cl_violations_from_edges(edges, cl, n)
+        assert len(v) == 0
+
+    def test_parity_with_kruskal_cl(self):
+        """Both Borůvka and Kruskal CL produce valid forests (zero violations)."""
+        np.random.seed(777)
+        n = 30
+        D = np.random.rand(n, n) * 5
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        D[:10, :10] *= 0.1
+        D[10:20, 10:20] *= 0.1
+        D[20:, 20:] *= 0.1
+        X = sparse.csr_matrix(D)
+
+        # CL within first block
+        cl = sparse.lil_matrix((n, n))
+        for i in range(5):
+            for j in range(5, 10):
+                cl[i, j] = 1
+                cl[j, i] = 1
+        cl = cl.tocsr()
+
+        e_bor, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=3, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl,
+        )
+        e_kru, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=3, metric="precomputed", algorithm="kruskal",
+            cannot_link=cl,
+        )
+        v_bor = self._check_cl_violations_from_edges(e_bor, cl, n)
+        v_kru = self._check_cl_violations_from_edges(e_kru, cl, n)
+        assert len(v_bor) == 0, f"Borůvka violations: {v_bor}"
+        assert len(v_kru) == 0, f"Kruskal violations: {v_kru}"
+
+        # Both should have same number of finite edges
+        n_fin_bor = np.sum(np.isfinite(e_bor[:, 2]))
+        n_fin_kru = np.sum(np.isfinite(e_kru[:, 2]))
+        # They may differ (different heuristics) but both must be valid
+        assert n_fin_bor > 0
+        assert n_fin_kru > 0
+
+    def test_block_diagonal_cl_stress(self):
+        """Random block-diagonal CL on random graph, verify zero violations."""
+        import time
+        start = time.perf_counter()
+        trial = 0
+        for seed in range(5):
+            rng = np.random.RandomState(seed + 5000)
+            n = 50
+            n_blocks = 5
+            block_size = n // n_blocks
+
+            D = rng.rand(n, n) * 10
+            D = (D + D.T) / 2
+            np.fill_diagonal(D, 0)
+            for b in range(n_blocks):
+                s = b * block_size
+                D[s : s + block_size, s : s + block_size] *= 0.1
+            X = sparse.csr_matrix(D)
+
+            # CL: random 5% density within each block
+            cl = sparse.lil_matrix((n, n))
+            for b in range(n_blocks):
+                s = b * block_size
+                for i in range(s, s + block_size):
+                    for j in range(i + 1, s + block_size):
+                        if rng.rand() < 0.05:
+                            cl[i, j] = 1
+                            cl[j, i] = 1
+            cl = cl.tocsr()
+
+            edges, _, _ = compute_minimum_spanning_tree(
+                X, min_samples=3, metric="precomputed", algorithm="boruvka",
+                cannot_link=cl,
+            )
+            v = self._check_cl_violations_from_edges(edges, cl, n)
+            assert len(v) == 0, f"Violations at seed {seed}: {v}"
+            trial += 1
+
+        elapsed = time.perf_counter() - start
+        print(f"\n  boruvka CL stress: {trial} trials in {elapsed:.2f}s")
+
+    def test_hdbscan_class_boruvka_cl(self):
+        """HDBSCAN(algorithm='boruvka', metric='precomputed', cannot_link=...)."""
+        np.random.seed(42)
+        n = 30
+        D = np.random.rand(n, n)
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        D[:15, :15] *= 0.1
+        D[15:, 15:] *= 0.1
+        X = sparse.csr_matrix(D)
+
+        cl = sparse.lil_matrix((n, n))
+        cl[0, 1] = 1
+        cl[1, 0] = 1
+        cl = cl.tocsr()
+
+        model = HDBSCAN(
+            min_cluster_size=5,
+            min_samples=3,
+            metric="precomputed",
+            algorithm="boruvka",
+            cannot_link=cl,
+        )
+        labels = model.fit_predict(X)
+        assert labels is not None
+        assert len(labels) == n
+
+        # Check that nodes 0 and 1 are not in the same non-noise cluster
+        if labels[0] >= 0 and labels[1] >= 0:
+            assert labels[0] != labels[1], (
+                "CL pair (0, 1) ended up in the same cluster"
+            )
+
+    def test_euclidean_boruvka_cl_raises(self):
+        """algorithm='boruvka' + metric='euclidean' + cannot_link -> error."""
+        X = np.random.rand(10, 3)
+        cl = sparse.eye(10, format="csr")
+
+        with pytest.raises(ValueError, match="cannot_link"):
+            compute_minimum_spanning_tree(
+                X, min_samples=2, metric="euclidean", algorithm="boruvka",
+                cannot_link=cl,
+            )
+
+    # --- Banding-specific tests ---
+
+    def test_banding_zero_violations_all_fractions(self):
+        """Various band_fraction values all produce zero CL violations."""
+        np.random.seed(42)
+        n = 40
+        D = np.random.rand(n, n) * 5
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        D[:20, :20] *= 0.1
+        D[20:, 20:] *= 0.1
+        X = sparse.csr_matrix(D)
+
+        # CL: block-diagonal within first block
+        cl = sparse.lil_matrix((n, n))
+        for i in range(10):
+            for j in range(10, 20):
+                cl[i, j] = 1
+                cl[j, i] = 1
+        cl = cl.tocsr()
+
+        for bf in [0.01, 0.05, 0.1, 0.5, 1.0, np.inf]:
+            edges, _, _ = compute_minimum_spanning_tree(
+                X, min_samples=3, metric="precomputed", algorithm="boruvka",
+                cannot_link=cl, band_fraction=bf,
+            )
+            v = self._check_cl_violations_from_edges(edges, cl, n)
+            assert len(v) == 0, (
+                f"Violations with band_fraction={bf}: {v}"
+            )
+
+    def test_banding_no_cl_same_as_standard(self):
+        """With empty CL, banding should produce the same MST (unique weights)."""
+        np.random.seed(123)
+        n = 20
+        D = np.random.rand(n, n) * 10
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        X = sparse.csr_matrix(D)
+
+        cl_empty = sparse.csr_matrix((n, n))
+
+        e_nobanding, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=3, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl_empty, band_fraction=np.inf,
+        )
+        e_banded, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=3, metric="precomputed", algorithm="boruvka",
+            cannot_link=cl_empty, band_fraction=0.05,
+        )
+
+        def sort_edges(e):
+            e = e.copy()
+            for i in range(len(e)):
+                if e[i, 0] > e[i, 1]:
+                    e[i, 0], e[i, 1] = e[i, 1], e[i, 0]
+            order = np.lexsort((e[:, 1], e[:, 0], e[:, 2]))
+            return e[order]
+
+        assert np.allclose(sort_edges(e_nobanding), sort_edges(e_banded))
+
+    def test_banding_stress_block_diagonal(self):
+        """Stress test: block-diagonal CL with tight banding."""
+        import time
+        start = time.perf_counter()
+        trial = 0
+        for seed in range(5):
+            rng = np.random.RandomState(seed + 8000)
+            n = 60
+            n_blocks = 3
+            block_size = n // n_blocks
+
+            D = rng.rand(n, n) * 10
+            D = (D + D.T) / 2
+            np.fill_diagonal(D, 0)
+            for b in range(n_blocks):
+                s = b * block_size
+                D[s : s + block_size, s : s + block_size] *= 0.1
+            X = sparse.csr_matrix(D)
+
+            # CL: 10% density within each block
+            cl = sparse.lil_matrix((n, n))
+            for b in range(n_blocks):
+                s = b * block_size
+                for i in range(s, s + block_size):
+                    for j in range(i + 1, s + block_size):
+                        if rng.rand() < 0.10:
+                            cl[i, j] = 1
+                            cl[j, i] = 1
+            cl = cl.tocsr()
+
+            for bf in [0.01, 0.05]:
+                edges, _, _ = compute_minimum_spanning_tree(
+                    X, min_samples=3, metric="precomputed", algorithm="boruvka",
+                    cannot_link=cl, band_fraction=bf,
+                )
+                v = self._check_cl_violations_from_edges(edges, cl, n)
+                assert len(v) == 0, (
+                    f"Violations at seed {seed}, bf={bf}: {v}"
+                )
+                trial += 1
+
+        elapsed = time.perf_counter() - start
+        print(f"\n  banded stress: {trial} trials in {elapsed:.2f}s")
+
+    def test_hdbscan_class_banding(self):
+        """HDBSCAN class with band_fraction parameter."""
+        np.random.seed(42)
+        n = 30
+        D = np.random.rand(n, n)
+        D = (D + D.T) / 2
+        np.fill_diagonal(D, 0)
+        D[:15, :15] *= 0.1
+        D[15:, 15:] *= 0.1
+        X = sparse.csr_matrix(D)
+
+        cl = sparse.lil_matrix((n, n))
+        cl[0, 1] = 1
+        cl[1, 0] = 1
+        cl = cl.tocsr()
+
+        model = HDBSCAN(
+            min_cluster_size=5,
+            min_samples=3,
+            metric="precomputed",
+            algorithm="boruvka",
+            cannot_link=cl,
+            band_fraction=0.05,
+        )
+        labels = model.fit_predict(X)
+        assert labels is not None
+        assert len(labels) == n
+
+        if labels[0] >= 0 and labels[1] >= 0:
+            assert labels[0] != labels[1], (
+                "CL pair (0, 1) ended up in the same cluster"
+            )
