@@ -1,15 +1,28 @@
-"""Constrained Borůvka MST — KD-tree + precomputed paths with CL enforcement.
+"""Constrained Boruvka MST -- KD-tree + precomputed paths with CL enforcement.
 
-Supports two metric pathways (euclidean via KD-tree, precomputed via sparse CSR)
-using a unified 3-layer cannot-link (CL) enforcement model:
-  L1 — Direct CL skip during candidate selection.
-  L2 — fix_violations after each Borůvka round (transitive violation repair).
-  L3 — Post-hoc label splitting via greedy graph-coloring (_apply_posthoc_cleanup).
+Supports two metric pathways:
+  - euclidean via KD-tree  -> parallel_boruvka()
+  - precomputed via sparse CSR -> minimum_spanning_tree_constrained()
+
+CL (cannot-link) enforcement uses a single unified strategy on both paths:
+  1. L1 -- Direct CL pair skip during candidate selection (KD-tree leaf filter
+     or CSR neighbor scan).  Prevents individual CL pairs from being proposed.
+  2. Preventive DSU check -- Before each merge, walk the linked-list DSU to
+     verify that no *transitive* CL violation would be created.  If blocked,
+     the merge is skipped and the pair is recorded.
+  3. CL expansion -- Blocked pairs are added to the CSR CL graph (grow_cl_csr)
+     so that the next round's L1 filter learns about them.  This closes the
+     loop: transitive violations discovered by the DSU check become direct
+     CL entries for future L1 filtering.
+  4. Bridge with +inf -- After the MSF is built, disconnected components are
+     bridged with np.inf edges via bridge_forest_with_inf.  The downstream
+     cluster_trees.py lambda=0 logic prevents cross-component cluster merging.
+
+No L2 (fix_violations) or L3 (posthoc cleanup) layers are needed -- the
+preventive DSU check eliminates all violations before they enter the MST.
 
 Functions whose Numba JIT signatures match the unconstrained base modules are
-imported directly. Only those gaining CL parameters are re-declared here.
-
-See boruvka_constrained_verbose.py for the annotated reference implementation.
+imported directly.  Only those gaining CL parameters are re-declared here.
 """
 
 import numba
@@ -17,29 +30,55 @@ import numpy as np
 
 from .disjoint_set import ds_rank_create, ds_find, ds_find_readonly, ds_union_by_rank
 from .variables import NUMBA_CACHE
+
+# -- Imported unchanged from boruvka.py --
+# These utility functions have identical signatures and semantics in the
+# constrained path; no CL parameters needed.
 from .boruvka import (
-    select_components, update_component_vectors, calculate_block_size,
-    update_component_bounds_from_block, sample_weight_core_distance,
+    update_component_vectors,   # parallel update of point/node component labels
+    calculate_block_size,       # adaptive block sizing for reproducible queries
+    update_component_bounds_from_block,  # sequential bound merge after prange block
+    sample_weight_core_distance,  # weighted core distance computation
 )
+
+# -- KD-tree primitives (used by CL-extended query functions) --
 from .numba_kdtree import (
     parallel_tree_query, rdist, point_to_node_lower_bound_rdist,
-    NumbaKDTree, build_kdtree,
+    NumbaKDTree, build_kdtree, simple_heap_push,
 )
+
+# -- Precomputed path imports --
 from .core_graph import CoreGraph, update_point_components, update_graph_components
 from .precomputed import (
-    validate_precomputed_sparse_graph, extract_undirected_min_edges,
-    build_adjacency_lists, compute_sparse_core_distances,
-    apply_mutual_reachability, to_core_graph_arrays,
+    validate_precomputed_sparse_graph,
+    bridge_forest_with_inf,
 )
+
+# -- Clustering pipeline --
 from .hdbscan import clusters_from_spanning_tree
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Constraint validation (pure Python)
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def validate_constraints(n_points, cl_indptr, cl_indices):
-    """Validate CSR cannot-link arrays (shapes, dtypes, symmetry, no self-links)."""
+    """Validate CSR cannot-link arrays (shapes, dtypes, symmetry, no self-links).
+
+    Parameters
+    ----------
+    n_points : int
+        Number of data points.
+    cl_indptr : ndarray, int64, shape (n_points + 1,)
+        CSR row pointers for the CL graph.
+    cl_indices : ndarray, int32, shape (nnz,)
+        CSR column indices for the CL graph.
+
+    Raises
+    ------
+    ValueError
+        If any validation check fails.
+    """
     cl_indptr = np.asarray(cl_indptr)
     cl_indices = np.asarray(cl_indices)
 
@@ -75,13 +114,17 @@ def validate_constraints(n_points, cl_indptr, cl_indices):
                     f"Asymmetric CL constraint: ({i}, {j}) present but ({j}, {i}) missing.")
 
 
-# ---------------------------------------------------------------------------
-# CL helpers (Numba JIT — shared by both paths)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CL helpers (Numba JIT -- shared by both KD-tree and precomputed paths)
+# ===========================================================================
 
 @numba.njit(cache=NUMBA_CACHE, inline="always")
 def points_have_cannot_link(point_a, point_b, cl_indptr, cl_indices):
-    """Return True if (point_a, point_b) is a direct CL pair (O(degree) scan)."""
+    """Return True if (point_a, point_b) is a direct CL pair.
+
+    Scans point_a's CL neighbor list -- O(degree) per call.  Used for L1
+    filtering in both the KD-tree leaf scan and the precomputed CSR scan.
+    """
     for k in range(cl_indptr[point_a], cl_indptr[point_a + 1]):
         if cl_indices[k] == point_b:
             return True
@@ -91,7 +134,15 @@ def points_have_cannot_link(point_a, point_b, cl_indptr, cl_indices):
 @numba.njit(cache=NUMBA_CACHE)
 def check_merge_violates(root_small, root_large, parent, head, next_node,
                          cl_indptr, cl_indices):
-    """Return True if merging root_small into root_large would create a CL violation."""
+    """Return True if merging root_small into root_large would create a CL violation.
+
+    Walks the linked-list of members in root_small's component. For each
+    member, scans its CL neighbors and checks (via read-only DSU find)
+    whether any CL neighbor already belongs to root_large's component.
+
+    This is the *preventive* check -- it runs BEFORE the union, so no
+    violation ever enters the MST.
+    """
     node = head[root_small]
     while node != -1:
         for k in range(np.int64(cl_indptr[node]), np.int64(cl_indptr[node + 1])):
@@ -101,241 +152,215 @@ def check_merge_violates(root_small, root_large, parent, head, next_node,
     return False
 
 
-@numba.njit(cache=NUMBA_CACHE)
-def component_has_violation(root, parent, head, next_node, cl_indptr, cl_indices):
-    """Return True if component *root* contains an internal CL violation."""
-    node = head[root]
-    while node != -1:
-        for k in range(np.int64(cl_indptr[node]), np.int64(cl_indptr[node + 1])):
-            if ds_find_readonly(parent, np.int32(cl_indices[k])) == root:
-                return True
-        node = next_node[node]
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Linked-list DSU helpers (shared by both paths)
-# ---------------------------------------------------------------------------
-
 @numba.njit(cache=NUMBA_CACHE, inline="always")
 def linked_list_merge(head, tail, next_node, winner, loser):
-    """Splice loser's member list onto winner's linked-list chain."""
+    """Splice loser's member list onto winner's linked-list chain.
+
+    O(1) operation -- just redirects the tail pointer.  After this call,
+    iterating head[winner] -> next_node -> ... visits all members of both
+    former components.
+    """
     next_node[tail[winner]] = head[loser]
     tail[winner] = tail[loser]
 
 
-@numba.njit(cache=NUMBA_CACHE)
-def rebuild_linked_list_dsu(n_points, mst_edges, n_edges):
-    """Rebuild full DSU + linked-list from scratch by replaying mst_edges[0:n_edges]."""
-    parent = np.arange(n_points, dtype=np.int32)
-    rank = np.zeros(n_points, dtype=np.int32)
-    head = np.arange(n_points, dtype=np.int32)
-    tail = np.arange(n_points, dtype=np.int32)
-    next_node = np.full(n_points, -1, dtype=np.int32)
-    for e in range(n_edges):
-        u = np.int32(mst_edges[e, 0])
-        v = np.int32(mst_edges[e, 1])
-        ru = u
-        while parent[ru] != ru:
-            parent[ru] = parent[parent[ru]]
-            ru = parent[ru]
-        rv = v
-        while parent[rv] != rv:
-            parent[rv] = parent[parent[rv]]
-            rv = parent[rv]
-        if ru == rv:
-            continue
-        if rank[ru] < rank[rv]:
-            ru, rv = rv, ru
-        parent[rv] = ru
-        if rank[ru] == rank[rv]:
-            rank[ru] += 1
-        next_node[tail[ru]] = head[rv]
-        tail[ru] = tail[rv]
-    return parent, rank, head, tail, next_node
-
-
-# ---------------------------------------------------------------------------
-# L2 — fix_violations (shared by both paths)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Dynamic CL expansion (grow CSR in-place within Numba)
+# ===========================================================================
 
 @numba.njit(cache=NUMBA_CACHE)
-def fix_violations(n_points, mst_edges, n_added, round_edges_u, round_edges_v,
-                   round_edges_w, round_count, cl_indptr, cl_indices,
-                   parent, head, tail, next_node):
-    """Detect and repair CL violations from the last merge round (Layer 2).
+def grow_cl_csr(cl_indptr, cl_indices, new_u, new_v, n_new):
+    """Add symmetric CL pairs to CSR arrays.  Returns new (indptr, indices).
 
-    Finds violating components, removes their heaviest round-edge, rebuilds
-    the DSU, and repeats until clean.
+    For each pair (u, v), adds u->v and v->u if not already present.
+    This is called after each Boruvka round to record blocked merges, so
+    that the next round's L1 filter automatically skips those pairs.
     """
-    removed_edges = np.empty((round_count, 3), dtype=np.float64)
-    n_removed = np.int32(0)
-    round_edge_removed = np.zeros(round_count, dtype=numba.boolean)
+    n = cl_indptr.shape[0] - 1
 
-    # Build initial worklist of violating component roots
-    worklist = np.empty(n_points, dtype=np.int32)
-    worklist_count = np.int32(0)
-    for r in range(n_points):
-        if parent[r] == r:
-            if component_has_violation(r, parent, head, next_node, cl_indptr, cl_indices):
-                worklist[worklist_count] = r
-                worklist_count += 1
+    # First pass: count genuinely-new entries per row
+    extra = np.zeros(n, dtype=np.int64)
+    for k in range(n_new):
+        u = np.int32(new_u[k])
+        v = np.int32(new_v[k])
+        # u -> v
+        found = False
+        for j in range(cl_indptr[u], cl_indptr[u + 1]):
+            if cl_indices[j] == v:
+                found = True
+                break
+        if not found:
+            extra[u] += 1
+        # v -> u
+        found = False
+        for j in range(cl_indptr[v], cl_indptr[v + 1]):
+            if cl_indices[j] == u:
+                found = True
+                break
+        if not found:
+            extra[v] += 1
 
-    max_iters = round_count + 1
-    iters = 0
-    while worklist_count > 0 and iters < max_iters:
-        iters += 1
-        worklist_count -= 1
-        current_root = worklist[worklist_count]
+    total_extra = np.int64(0)
+    for i in range(n):
+        total_extra += extra[i]
+    if total_extra == 0:
+        return cl_indptr, cl_indices
 
-        # Re-find root (may have changed after prior rebuild)
-        cr = current_root
-        while parent[cr] != cr:
-            cr = parent[cr]
-        current_root = cr
+    # Build new CSR arrays with room for the extra entries
+    new_nnz = cl_indices.shape[0] + total_extra
+    new_indptr = np.empty(n + 1, dtype=np.int64)
+    new_indices = np.empty(new_nnz, dtype=np.int32)
 
-        if not component_has_violation(current_root, parent, head, next_node,
-                                       cl_indptr, cl_indices):
-            continue
+    new_indptr[0] = np.int64(0)
+    for i in range(n):
+        new_indptr[i + 1] = new_indptr[i] + (cl_indptr[i + 1] - cl_indptr[i]) + extra[i]
 
-        # Find the heaviest round-edge inside this component
-        best_idx = np.int32(-1)
-        best_w = -np.inf
-        for ri in range(round_count):
-            if round_edge_removed[ri]:
-                continue
-            eu, ev, ew = round_edges_u[ri], round_edges_v[ri], round_edges_w[ri]
-            eru = eu
-            while parent[eru] != eru:
-                eru = parent[eru]
-            erv = ev
-            while parent[erv] != erv:
-                erv = parent[erv]
-            if eru == current_root and erv == current_root and ew > best_w:
-                best_w = ew
-                best_idx = ri
-
-        if best_idx == -1:
-            continue
-
-        round_edge_removed[best_idx] = True
-        removed_u = round_edges_u[best_idx]
-        removed_v = round_edges_v[best_idx]
-        removed_w = round_edges_w[best_idx]
-        removed_edges[n_removed, 0] = np.float64(removed_u)
-        removed_edges[n_removed, 1] = np.float64(removed_v)
-        removed_edges[n_removed, 2] = removed_w
-        n_removed += 1
-
-        # Compact mst_edges: remove all round_edge_removed entries
-        temp_mst = np.empty((n_added, 3), dtype=np.float64)
-        temp_n = np.int32(0)
-        for e in range(n_added):
-            eu2 = np.int32(mst_edges[e, 0])
-            ev2 = np.int32(mst_edges[e, 1])
-            ew2 = mst_edges[e, 2]
-            is_removed = False
-            for rr in range(round_count):
-                if round_edge_removed[rr]:
-                    if ((eu2 == round_edges_u[rr] and ev2 == round_edges_v[rr])
-                            or (eu2 == round_edges_v[rr] and ev2 == round_edges_u[rr])) \
-                            and ew2 == round_edges_w[rr]:
-                        is_removed = True
+    for i in range(n):
+        old_start = cl_indptr[i]
+        old_end = cl_indptr[i + 1]
+        ns = new_indptr[i]
+        # Copy existing entries
+        for j in range(old_end - old_start):
+            new_indices[ns + j] = cl_indices[old_start + j]
+        # Append new entries for this row
+        pos = ns + (old_end - old_start)
+        for k in range(n_new):
+            u = np.int32(new_u[k])
+            v = np.int32(new_v[k])
+            target = np.int32(-1)
+            if u == np.int32(i):
+                target = v
+            elif v == np.int32(i):
+                target = u
+            if target >= 0:
+                already = False
+                for j in range(old_start, old_end):
+                    if cl_indices[j] == target:
+                        already = True
                         break
-            if not is_removed:
-                temp_mst[temp_n, 0] = mst_edges[e, 0]
-                temp_mst[temp_n, 1] = mst_edges[e, 1]
-                temp_mst[temp_n, 2] = mst_edges[e, 2]
-                temp_n += 1
+                if not already:
+                    new_indices[pos] = target
+                    pos += 1
 
-        # Rebuild DSU from surviving edges
-        new_parent, new_rank, new_head, new_tail, new_next_node = \
-            rebuild_linked_list_dsu(n_points, temp_mst, temp_n)
-        for i in range(n_points):
-            parent[i] = new_parent[i]
-            head[i] = new_head[i]
-            tail[i] = new_tail[i]
-            next_node[i] = new_next_node[i]
-        for e in range(temp_n):
-            mst_edges[e, 0] = temp_mst[e, 0]
-            mst_edges[e, 1] = temp_mst[e, 1]
-            mst_edges[e, 2] = temp_mst[e, 2]
-        n_added = temp_n
-
-        # Check sub-components for remaining violations
-        sub_a = removed_u
-        while parent[sub_a] != sub_a:
-            sub_a = parent[sub_a]
-        sub_b = removed_v
-        while parent[sub_b] != sub_b:
-            sub_b = parent[sub_b]
-        if component_has_violation(sub_a, parent, head, next_node, cl_indptr, cl_indices):
-            worklist[worklist_count] = sub_a
-            worklist_count += 1
-        if sub_a != sub_b and component_has_violation(sub_b, parent, head, next_node,
-                                                       cl_indptr, cl_indices):
-            worklist[worklist_count] = sub_b
-            worklist_count += 1
-
-    return parent, head, tail, next_node, mst_edges, n_added, removed_edges, n_removed
+    return new_indptr, new_indices
 
 
-# ---------------------------------------------------------------------------
-# KD-tree path — re-declared functions (CL-extended signatures)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# KD-tree path -- CL-extended Numba functions
+# ===========================================================================
+# These functions mirror their boruvka.py counterparts but add CL parameters
+# (cl_indptr, cl_indices) and linked-list DSU arrays (head, tail, next_node).
+# They cannot be imported because Numba JIT specialises on function signature.
 
-@numba.njit(locals={"i": numba.types.int64}, cache=NUMBA_CACHE)
+@numba.njit(locals={"i": numba.types.int32, "result_idx": numba.types.int32,
+                    "blocked_idx": numba.types.int32},
+            cache=NUMBA_CACHE)
 def merge_components(disjoint_set, candidate_neighbors, candidate_neighbor_distances,
                      point_components, head, tail, next_node, cl_indptr, cl_indices):
-    """Select best cross-component edge per component and merge (KD-tree path).
+    """Select cheapest cross-component edge per component and merge (KD-tree path).
 
-    Merges are naive; fix_violations (L2) repairs transitive CL violations afterward.
+    Uses multiple passes over the candidate array with flat arrays.  On each
+    pass, the cheapest remaining edge per component is found.  If a preventive
+    CL check blocks that edge, its distance is invalidated (set to inf) so the
+    next pass automatically promotes the component's next-cheapest candidate.
+
+    Returns
+    -------
+    merged_edges : float64[:, 3]  -- accepted MST edges
+    blocked_u, blocked_v : int32[:] -- endpoints of blocked merges (for CL expansion)
+    n_blocked : int32
     """
     n_points = candidate_neighbors.shape[0]
-    component_edges = {
-        np.int64(0): (np.int64(0), np.int64(1), np.float32(0.0)) for i in range(0)
-    }
-    for i in range(n_points):
-        from_component = np.int64(point_components[i])
-        if from_component in component_edges and not np.isnan(candidate_neighbor_distances[i]):
-            if candidate_neighbor_distances[i] < component_edges[from_component][2]:
-                component_edges[from_component] = (
-                    np.int64(i), np.int64(candidate_neighbors[i]),
-                    candidate_neighbor_distances[i])
-        else:
-            component_edges[from_component] = (
-                np.int64(i), np.int64(candidate_neighbors[i]),
-                candidate_neighbor_distances[i])
 
-    result = np.empty((len(component_edges), 3), dtype=np.float64)
-    round_edges_u = np.empty(len(component_edges), dtype=np.int32)
-    round_edges_v = np.empty(len(component_edges), dtype=np.int32)
-    round_edges_w = np.empty(len(component_edges), dtype=np.float64)
+    # Work on a copy so we can invalidate blocked edges
+    cand_dist = candidate_neighbor_distances.copy()
+
+    component_done = np.zeros(n_points, dtype=numba.boolean)
+    result = np.empty((n_points, 3), dtype=np.float64)
+    blocked_u = np.empty(n_points, dtype=np.int32)
+    blocked_v = np.empty(n_points, dtype=np.int32)
     result_idx = np.int32(0)
+    blocked_idx = np.int32(0)
 
-    for edge in component_edges.values():
-        from_component = ds_find(disjoint_set, np.int32(edge[0]))
-        to_component = ds_find(disjoint_set, np.int32(edge[1]))
-        if from_component == to_component:
-            continue
-        result[result_idx] = (np.float64(edge[0]), np.float64(edge[1]), np.float64(edge[2]))
-        round_edges_u[result_idx] = np.int32(edge[0])
-        round_edges_v[result_idx] = np.int32(edge[1])
-        round_edges_w[result_idx] = np.float64(edge[2])
-        result_idx += 1
+    # Flat arrays indexed by component ID (faster than typed dict)
+    best_dist = np.empty(n_points, dtype=np.float32)
+    best_src = np.empty(n_points, dtype=np.int32)
+    best_dst = np.empty(n_points, dtype=np.int32)
 
-        from_component = ds_find(disjoint_set, np.int32(edge[0]))
-        to_component = ds_find(disjoint_set, np.int32(edge[1]))
-        if from_component == to_component:
-            result_idx -= 1
-            continue
-        ds_union_by_rank(disjoint_set, from_component, to_component)
-        new_root = ds_find(disjoint_set, from_component)
-        loser = to_component if new_root == from_component else from_component
-        linked_list_merge(head, tail, next_node, new_root, loser)
+    max_passes = np.int32(5)  # small cap; outer loop handles rest
+    for _pass in range(max_passes):
+        # Reset per-component best
+        for i in range(n_points):
+            best_dist[i] = np.float32(np.inf)
+            best_src[i] = np.int32(-1)
 
-    return (result[:result_idx], round_edges_u[:result_idx],
-            round_edges_v[:result_idx], round_edges_w[:result_idx], result_idx)
+        # Find cheapest valid edge per unfinished component
+        for i in range(n_points):
+            comp = point_components[i]
+            if component_done[comp]:
+                continue
+            d = cand_dist[i]
+            j = candidate_neighbors[i]
+            if j < 0 or np.isnan(d) or d == np.inf:
+                continue
+            if point_components[j] == comp:
+                continue
+            if d < best_dist[comp]:
+                best_dist[comp] = d
+                best_src[comp] = np.int32(i)
+                best_dst[comp] = np.int32(j)
+
+        # Try merging each component's best
+        had_block = False
+        any_candidate = False
+        for comp in range(n_points):
+            src = best_src[comp]
+            if src < 0:
+                continue
+            any_candidate = True
+            dst = best_dst[comp]
+            from_comp = ds_find(disjoint_set, src)
+            to_comp = ds_find(disjoint_set, dst)
+            if from_comp == to_comp:
+                continue
+
+            orig_comp = point_components[src]
+            if component_done[orig_comp]:
+                continue
+
+            # -- Preventive CL check --
+            if cl_indptr.shape[0] > 1:
+                if check_merge_violates(from_comp, to_comp,
+                                        disjoint_set.parent, head, next_node,
+                                        cl_indptr, cl_indices):
+                    blocked_u[blocked_idx] = src
+                    blocked_v[blocked_idx] = dst
+                    blocked_idx += 1
+                    cand_dist[src] = np.float32(np.inf)
+                    had_block = True
+                    continue
+
+            # -- Accept merge --
+            result[result_idx] = (np.float64(src), np.float64(dst),
+                                  np.float64(best_dist[comp]))
+            result_idx += 1
+            component_done[orig_comp] = True
+
+            from_comp = ds_find(disjoint_set, src)
+            to_comp = ds_find(disjoint_set, dst)
+            if from_comp == to_comp:
+                result_idx -= 1
+                continue
+            ds_union_by_rank(disjoint_set, from_comp, to_comp)
+            new_root = ds_find(disjoint_set, from_comp)
+            loser = to_comp if new_root == from_comp else from_comp
+            linked_list_merge(head, tail, next_node, new_root, loser)
+
+        if not had_block or not any_candidate:
+            break  # no blocked merges or no candidates left
+
+    return (result[:result_idx],
+            blocked_u[:blocked_idx], blocked_v[:blocked_idx], blocked_idx)
 
 
 @numba.njit(
@@ -354,18 +379,32 @@ def component_aware_query_recursion(
         current_component, node_components, point_components,
         dist_lower_bound, component_nearest_neighbor_dist,
         query_point_index, cl_indptr, cl_indices):
-    """KD-tree NN search with component awareness and L1 CL filtering."""
+    """KD-tree nearest-neighbor search with component awareness and L1 CL filtering.
+
+    Mirrors boruvka.py's component_aware_query_recursion but adds three extra
+    parameters (query_point_index, cl_indptr, cl_indices) to skip direct CL
+    pairs at the leaf level.  This is the L1 filter for the KD-tree path.
+
+    The pruning rules (Cases 1a-1c) are identical to the unconstrained version:
+      1a. dist_lower_bound > heap_p[0]  -> can't improve on current best
+      1b. dist_lower_bound or core_dist > component bound -> no gain
+      1c. node contains only same-component points -> skip entire subtree
+    """
     is_leaf = tree.is_leaf[node]
     idx_start = tree.idx_start[node]
     idx_end = tree.idx_end[node]
 
+    # Case 1a: can't improve on current best distance
     if dist_lower_bound > heap_p[0]:
         return
+    # Case 1b: can't improve on component's best distance
     elif (dist_lower_bound > component_nearest_neighbor_dist[0]
           or current_core_distance > component_nearest_neighbor_dist[0]):
         return
+    # Case 1c: entire subtree is same component as query
     elif node_components[node] == current_component:
         return
+    # Case 2: leaf node -- scan points with L1 CL filtering
     elif is_leaf:
         for i in range(idx_start, idx_end):
             idx = tree.idx_array[i]
@@ -373,15 +412,16 @@ def component_aware_query_recursion(
                 continue
             if core_distances[idx] >= component_nearest_neighbor_dist[0]:
                 continue
+            # -- L1 filter: skip if direct CL pair --
             if cl_indptr.shape[0] > 1 and points_have_cannot_link(
                     query_point_index, idx, cl_indptr, cl_indices):
                 continue
             d = max(rdist(point, tree.data[idx]), current_core_distance, core_distances[idx])
             if d < heap_p[0]:
-                heap_p[0] = d
-                heap_i[0] = idx
+                simple_heap_push(heap_p, heap_i, d, idx)
                 if d < component_nearest_neighbor_dist[0]:
                     component_nearest_neighbor_dist[0] = d
+    # Case 3: internal node -- recurse into closer child first
     else:
         left = 2 * node + 1
         right = left + 1
@@ -425,7 +465,11 @@ def component_aware_query_recursion(
 )
 def boruvka_tree_query(tree, node_components, point_components, core_distances,
                        cl_indptr, cl_indices):
-    """Parallel KD-tree query: find each point's cheapest cross-component neighbor (L1)."""
+    """Parallel KD-tree query: find each point's cheapest cross-component neighbor.
+
+    Runs component_aware_query_recursion in parallel over all points.
+    L1 CL filtering is applied at the leaf level inside the recursion.
+    """
     candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
     candidate_indices = np.full(tree.data.shape[0], -1, dtype=np.int32)
     component_nearest_neighbor_dist = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
@@ -455,7 +499,12 @@ def boruvka_tree_query(tree, node_components, point_components, core_distances,
 )
 def boruvka_tree_query_reproducible(tree, node_components, point_components,
                                     core_distances, block_size, cl_indptr, cl_indices):
-    """Block-based reproducible KD-tree query with L1 CL filtering."""
+    """Block-based reproducible KD-tree query with L1 CL filtering.
+
+    Processes points in blocks to avoid race conditions on the shared
+    component_nearest_neighbor_dist array.  Within each block, points are
+    processed in parallel; between blocks, bounds are merged sequentially.
+    """
     candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
     candidate_indices = np.full(tree.data.shape[0], -1, dtype=np.int32)
     component_nearest_neighbor_dist = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
@@ -496,19 +545,32 @@ def boruvka_tree_query_reproducible(tree, node_components, point_components,
 def initialize_boruvka_from_knn(knn_indices, knn_distances, core_distances,
                                 disjoint_set, head, tail, next_node,
                                 cl_indptr, cl_indices):
-    """Bootstrap MST from KNN edges, skipping direct CL pairs (L1)."""
+    """Bootstrap MST from KNN edges with CL enforcement.
+
+    For each point, finds the first KNN neighbor that:
+      - is not a direct CL pair (L1 skip)
+      - has a lower core distance (standard Boruvka direction tie-break)
+    Then merges sequentially, checking each merge with check_merge_violates
+    (preventive DSU check) before accepting.
+
+    The parallel prange computes candidate edges; the sequential loop merges.
+    """
     component_edges = np.full((knn_indices.shape[0], 3), -1, dtype=np.float64)
     for i in numba.prange(knn_indices.shape[0]):
         for j in range(1, knn_indices.shape[1]):
             k = np.int32(knn_indices[i, j])
+            # L1: skip direct CL pairs
             if cl_indptr.shape[0] > 1 and points_have_cannot_link(
                     i, k, cl_indptr, cl_indices):
                 continue
             if core_distances[i] >= core_distances[k]:
                 edge_weight = max(core_distances[i], knn_distances[i, j])
-                component_edges[i] = (np.float64(i), np.float64(k), np.float64(edge_weight))
+                component_edges[i, 0] = np.float64(i)
+                component_edges[i, 1] = np.float64(k)
+                component_edges[i, 2] = np.float64(edge_weight)
                 break
 
+    # Sequential merge with preventive CL check
     result = np.empty((len(component_edges), 3), dtype=np.float64)
     result_idx = 0
     for edge in component_edges:
@@ -518,6 +580,14 @@ def initialize_boruvka_from_knn(knn_indices, knn_distances, core_distances,
         to_component = ds_find(disjoint_set, np.int32(edge[1]))
         if from_component == to_component:
             continue
+
+        # Preventive CL check before merge
+        if cl_indptr.shape[0] > 1:
+            if check_merge_violates(from_component, to_component,
+                                    disjoint_set.parent, head, next_node,
+                                    cl_indptr, cl_indices):
+                continue  # skip -- main Boruvka loop will find alternatives
+
         result[result_idx] = (np.float64(edge[0]), np.float64(edge[1]), np.float64(edge[2]))
         result_idx += 1
         from_component = ds_find(disjoint_set, np.int32(edge[0]))
@@ -535,9 +605,35 @@ def initialize_boruvka_from_knn(knn_indices, knn_distances, core_distances,
 @numba.njit(cache=NUMBA_CACHE)
 def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
                      reproducible=False, cl_indptr=None, cl_indices=None):
-    """Build MST via parallel Borůvka with CL support (KD-tree path).
+    """Build constrained MST via parallel Boruvka on a KD-tree.
 
-    Returns (edges, knn_neighbors, core_distances, n_rounds, n_violations_removed).
+    This is the main entry point for the KD-tree (euclidean) path.
+    CL enforcement uses L1 filtering + preventive DSU checks + CL expansion.
+
+    Parameters
+    ----------
+    tree : NumbaKDTree
+        KD-tree built from the data.
+    n_threads : int
+        Number of threads for parallel query.
+    min_samples : int
+        Core distance parameter (k-th nearest neighbor distance).
+    sample_weights : float32[:] or None
+        Per-point sample weights for weighted core distances.
+    reproducible : bool
+        If True, use block-based query for deterministic results.
+    cl_indptr : int64[:] or None
+        CSR row pointers for CL graph.  None = no constraints.
+    cl_indices : int32[:] or None
+        CSR column indices for CL graph.  None = no constraints.
+
+    Returns
+    -------
+    edges : float64[:, 3] -- MST/MSF edges [src, dst, weight] (euclidean distances)
+    knn_neighbors : int32[:, :] -- KNN indices (excluding self)
+    core_distances : float32[:] -- per-point core distances (euclidean)
+    n_rounds : int -- number of Boruvka rounds
+    n_blocked : int -- total number of blocked merges (CL expansion events)
     """
     n_points = tree.data.shape[0]
     if cl_indptr is None:
@@ -545,6 +641,7 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
     if cl_indices is None:
         cl_indices = np.empty(0, dtype=np.int32)
 
+    # -- Initialise DSU + linked-list structures --
     components_disjoint_set = ds_rank_create(n_points)
     point_components = np.arange(n_points)
     node_components = np.full(tree.idx_start.shape[0], -1)
@@ -552,7 +649,7 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
     tail = np.arange(n_points, dtype=np.int32)
     next_node = np.full(n_points, -1, dtype=np.int32)
 
-    # KNN initialisation — compute distances, neighbors, core_distances
+    # -- KNN initialisation -- compute distances, neighbors, core_distances --
     if sample_weights is not None:
         expected_neighbors = min_samples / np.mean(sample_weights)
         distances, neighbors = parallel_tree_query(
@@ -568,49 +665,23 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
             tree, tree.data, k=2, output_rdist=True)
         core_distances = np.zeros(n_points, dtype=np.float32)
 
+    # -- Bootstrap MST from KNN edges (parallel candidate + sequential merge) --
     initial_edges = initialize_boruvka_from_knn(
         neighbors, distances, core_distances, components_disjoint_set,
         head, tail, next_node, cl_indptr, cl_indices)
     update_component_vectors(
         tree, components_disjoint_set, node_components, point_components)
 
-    # Fix violations from KNN initialisation round (L2)
     all_edges = initial_edges
     round_number = np.int64(0)
-    total_violations_removed = np.int64(0)
-
-    if cl_indptr.shape[0] > 1 and all_edges.shape[0] > 0:
-        n_init = all_edges.shape[0]
-        init_round_u = np.empty(n_init, dtype=np.int32)
-        init_round_v = np.empty(n_init, dtype=np.int32)
-        init_round_w = np.empty(n_init, dtype=np.float64)
-        for _ie in range(n_init):
-            init_round_u[_ie] = np.int32(all_edges[_ie, 0])
-            init_round_v[_ie] = np.int32(all_edges[_ie, 1])
-            init_round_w[_ie] = all_edges[_ie, 2]
-        (parent_out, head_out, tail_out, next_out, all_edges, n_init_out,
-         _removed, _n_rem_init) = fix_violations(
-            n_points, all_edges, np.intp(n_init),
-            init_round_u, init_round_v, init_round_w, np.int32(n_init),
-            cl_indptr, cl_indices, components_disjoint_set.parent,
-            head, tail, next_node)
-        for _i in range(n_points):
-            components_disjoint_set.parent[_i] = parent_out[_i]
-            head[_i] = head_out[_i]
-            tail[_i] = tail_out[_i]
-            next_node[_i] = next_out[_i]
-        all_edges = all_edges[:n_init_out]
-        total_violations_removed += np.int64(_n_rem_init)
-        update_component_vectors(
-            tree, components_disjoint_set, node_components, point_components)
-
+    total_blocked = np.int64(0)
     n_components = len(np.unique(point_components))
 
-    # Main Borůvka loop
+    # -- Main Boruvka loop --
     while n_components > 1:
         round_number += np.int64(1)
 
-        # Step 1: find cheapest cross-component edges via KD-tree (L1)
+        # Step 1: KD-tree query (L1 filters CL pairs at the leaf)
         if reproducible:
             block_size = calculate_block_size(n_components, n_points, n_threads)
             candidate_distances, candidate_indices = boruvka_tree_query_reproducible(
@@ -621,65 +692,50 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
                 tree, node_components, point_components, core_distances,
                 cl_indptr, cl_indices)
 
-        # Step 2: merge components
-        (new_edges, round_edges_u, round_edges_v, round_edges_w,
-         round_count) = merge_components(
+        # Step 2: merge with preventive DSU check + multi-pass fallback
+        (new_edges, blocked_u, blocked_v,
+         n_blocked) = merge_components(
             components_disjoint_set, candidate_indices, candidate_distances,
             point_components, head, tail, next_node, cl_indptr, cl_indices)
-        if len(new_edges) == 0:
-            break
 
-        # Step 3: fix violations from this round (L2)
-        n_edges_before = all_edges.shape[0]
-        if cl_indptr.shape[0] > 1 and round_count > 0:
-            n_added = np.intp(n_edges_before + new_edges.shape[0])
-            combined = np.empty((n_added, 3), dtype=np.float64)
-            for e in range(n_edges_before):
-                combined[e, 0] = all_edges[e, 0]
-                combined[e, 1] = all_edges[e, 1]
-                combined[e, 2] = all_edges[e, 2]
-            for e in range(new_edges.shape[0]):
-                combined[n_edges_before + e, 0] = new_edges[e, 0]
-                combined[n_edges_before + e, 1] = new_edges[e, 1]
-                combined[n_edges_before + e, 2] = new_edges[e, 2]
-            (parent_out, head_out, tail_out, next_out, combined, n_added_out,
-             _removed_edges, _n_removed_round) = fix_violations(
-                n_points, combined, n_added,
-                round_edges_u, round_edges_v, round_edges_w, round_count,
-                cl_indptr, cl_indices, components_disjoint_set.parent,
-                head, tail, next_node)
-            total_violations_removed += np.int64(_n_removed_round)
-            for i in range(n_points):
-                head[i] = head_out[i]
-                tail[i] = tail_out[i]
-                next_node[i] = next_out[i]
-                components_disjoint_set.parent[i] = parent_out[i]
-            all_edges = combined[:n_added_out]
-            if n_added_out <= n_edges_before:
-                update_component_vectors(
-                    tree, components_disjoint_set, node_components, point_components)
-                break
-        else:
-            all_edges = np.vstack((all_edges, new_edges))
+        if new_edges.shape[0] == 0:
+            break  # no progress -- remaining components are CL-separated
 
-        # Step 4: update component vectors
+        all_edges = np.vstack((all_edges, new_edges))
+
+        # Step 3: grow CL with blocked pairs so next round's L1 skips them
+        if n_blocked > 0:
+            total_blocked += np.int64(n_blocked)
+            cl_indptr, cl_indices = grow_cl_csr(
+                cl_indptr, cl_indices, blocked_u, blocked_v, n_blocked)
+
+        # Step 4: update component vectors for next round
         update_component_vectors(
             tree, components_disjoint_set, node_components, point_components)
         n_components = len(np.unique(point_components))
 
+    # Convert from squared distances (rdist) to euclidean distances
     all_edges[:, 2] = np.sqrt(all_edges.T[2])
     return (all_edges, neighbors[:, 1:], np.sqrt(core_distances),
-            round_number, total_violations_removed)
+            round_number, total_blocked)
 
 
-# ---------------------------------------------------------------------------
-# Precomputed path — constrained graph-Borůvka functions
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Precomputed path -- constrained graph-Boruvka functions
+# ===========================================================================
+# These mirror core_graph.py's select_components / merge_components /
+# boruvka_mst but add CL enforcement with the SAME preventive DSU check
+# strategy as the KD-tree path above.
 
 @numba.njit(locals={"parent": numba.types.int32}, cache=NUMBA_CACHE)
 def select_components_constrained(distances, indices, indptr, point_components,
                                   cl_indptr, cl_indices):
-    """Find cheapest cross-component edge per component, skipping CL pairs (L1)."""
+    """Find cheapest cross-component edge per component, skipping CL pairs (L1).
+
+    Mirrors core_graph.select_components but adds L1 CL filtering: for each
+    point's sorted neighbor list, skips neighbors that are direct CL pairs.
+    Returns a typed dict mapping component_id -> (src, dst, weight).
+    """
     component_edges = {
         np.int64(0): (np.int32(0), np.int32(1), np.float32(0.0)) for _ in range(0)
     }
@@ -693,8 +749,10 @@ def select_components_constrained(distances, indices, indptr, point_components,
                 break
             neighbor = indices[idx]
             distance = distances[idx]
+            # Skip same-component neighbors
             if point_components[neighbor] == from_component:
                 continue
+            # L1: skip direct CL pairs
             if cl_indptr.shape[0] > 1 and points_have_cannot_link(
                     np.int32(parent), neighbor, cl_indptr, cl_indices):
                 continue
@@ -714,23 +772,47 @@ def select_components_constrained(distances, indices, indptr, point_components,
 
 @numba.njit(cache=NUMBA_CACHE)
 def merge_components_constrained(disjoint_set, component_edges,
-                                 head, tail, next_node):
-    """Merge components from cheapest edges, maintaining linked-list DSU."""
+                                 head, tail, next_node,
+                                 cl_indptr, cl_indices):
+    """Merge components from cheapest edges with preventive CL check.
+
+    Like the KD-tree merge_components, each candidate edge is checked with
+    check_merge_violates before the union.  Blocked merges are recorded and
+    returned for CL expansion.
+
+    Returns
+    -------
+    merged_edges : float64[:, 3]
+    blocked_u, blocked_v : int32[:] -- blocked merge endpoints
+    n_blocked : int32
+    """
     result = np.empty((len(component_edges), 3), dtype=np.float64)
-    round_edges_u = np.empty(len(component_edges), dtype=np.int32)
-    round_edges_v = np.empty(len(component_edges), dtype=np.int32)
-    round_edges_w = np.empty(len(component_edges), dtype=np.float64)
+    blocked_u = np.empty(len(component_edges), dtype=np.int32)
+    blocked_v = np.empty(len(component_edges), dtype=np.int32)
     result_idx = np.int32(0)
+    blocked_idx = np.int32(0)
+
     for edge in component_edges.values():
         from_component = ds_find(disjoint_set, edge[0])
         to_component = ds_find(disjoint_set, edge[1])
         if from_component == to_component:
             continue
-        result[result_idx] = (np.float64(edge[0]), np.float64(edge[1]), np.float64(edge[2]))
-        round_edges_u[result_idx] = np.int32(edge[0])
-        round_edges_v[result_idx] = np.int32(edge[1])
-        round_edges_w[result_idx] = np.float64(edge[2])
+
+        # -- Preventive CL check (same as KD-tree path) --
+        if cl_indptr.shape[0] > 1:
+            if check_merge_violates(from_component, to_component,
+                                    disjoint_set.parent, head, next_node,
+                                    cl_indptr, cl_indices):
+                blocked_u[blocked_idx] = edge[0]
+                blocked_v[blocked_idx] = edge[1]
+                blocked_idx += 1
+                continue
+
+        # -- Accept merge --
+        result[result_idx] = (np.float64(edge[0]), np.float64(edge[1]),
+                              np.float64(edge[2]))
         result_idx += 1
+
         from_component = ds_find(disjoint_set, edge[0])
         to_component = ds_find(disjoint_set, edge[1])
         if from_component == to_component:
@@ -740,13 +822,35 @@ def merge_components_constrained(disjoint_set, component_edges,
         new_root = ds_find(disjoint_set, from_component)
         loser = to_component if new_root == from_component else from_component
         linked_list_merge(head, tail, next_node, new_root, loser)
-    return (result[:result_idx], round_edges_u[:result_idx],
-            round_edges_v[:result_idx], round_edges_w[:result_idx], result_idx)
+
+    return (result[:result_idx],
+            blocked_u[:blocked_idx], blocked_v[:blocked_idx], blocked_idx)
 
 
 @numba.njit(cache=NUMBA_CACHE)
 def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices, overwrite=False):
-    """Constrained graph-Borůvka MST on a CoreGraph with L1+L2 CL enforcement."""
+    """Constrained graph-Boruvka MST on a CoreGraph (precomputed path).
+
+    Uses the SAME CL enforcement strategy as the KD-tree parallel_boruvka:
+      1. L1 skip in select_components_constrained
+      2. Preventive DSU check in merge_components_constrained
+      3. CL expansion via grow_cl_csr for blocked pairs
+
+    No L2 (fix_violations) or L3 (posthoc cleanup) needed.
+
+    Parameters
+    ----------
+    graph : CoreGraph namedtuple (weights, distances, indices, indptr)
+    cl_indptr : int64[:] -- CSR row pointers for CL graph
+    cl_indices : int32[:] -- CSR column indices for CL graph
+    overwrite : bool -- if True, modify graph arrays in-place
+
+    Returns
+    -------
+    n_components : int
+    point_components : int32[:]
+    edges : float64[:, 3] -- MST/MSF edges
+    """
     distances = graph.weights
     indices = graph.indices
     indptr = graph.indptr
@@ -755,56 +859,39 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices, overwrite=Fa
         indices = indices.copy()
         distances = distances.copy()
 
+    # -- Initialise DSU + linked-list structures --
     disjoint_set = ds_rank_create(n_points)
     point_components = np.arange(n_points, dtype=np.int32)
     n_components = n_points
     head = np.arange(n_points, dtype=np.int32)
     tail = np.arange(n_points, dtype=np.int32)
     next_node = np.full(n_points, -1, dtype=np.int32)
-    edges_list = [np.empty((0, 3), dtype=np.float64) for _ in range(0)]
-    total_edges = np.int32(0)
 
+    edges_list = [np.empty((0, 3), dtype=np.float64) for _ in range(0)]
+
+    # -- Main Boruvka loop --
     while n_components > 1:
+        # Step 1: select cheapest cross-component edge per component (L1 filter)
         comp_edges = select_components_constrained(
             distances, indices, indptr, point_components, cl_indptr, cl_indices)
-        (new_edges, round_edges_u, round_edges_v, round_edges_w,
-         round_count) = merge_components_constrained(
-            disjoint_set, comp_edges, head, tail, next_node)
+
+        # Step 2: merge with preventive DSU check
+        (new_edges, blocked_u, blocked_v,
+         n_blocked) = merge_components_constrained(
+            disjoint_set, comp_edges, head, tail, next_node,
+            cl_indptr, cl_indices)
+
         if new_edges.shape[0] == 0:
-            break
+            break  # no progress -- remaining components are CL-separated
+
         edges_list.append(new_edges)
 
-        # L2: fix violations from this round
-        if cl_indptr.shape[0] > 1 and round_count > 0:
-            n_prev = total_edges
-            n_added_total = np.intp(n_prev + new_edges.shape[0])
-            combined = np.empty((n_added_total, 3), dtype=np.float64)
-            comb_idx = np.int32(0)
-            for el in edges_list:
-                for e in range(el.shape[0]):
-                    combined[comb_idx, 0] = el[e, 0]
-                    combined[comb_idx, 1] = el[e, 1]
-                    combined[comb_idx, 2] = el[e, 2]
-                    comb_idx += 1
-            (parent_out, head_out, tail_out, next_out, combined, n_added_out,
-             _removed, _n_removed) = fix_violations(
-                n_points, combined, n_added_total,
-                round_edges_u, round_edges_v, round_edges_w, round_count,
-                cl_indptr, cl_indices, disjoint_set.parent, head, tail, next_node)
-            for i in range(n_points):
-                disjoint_set.parent[i] = parent_out[i]
-                head[i] = head_out[i]
-                tail[i] = tail_out[i]
-                next_node[i] = next_out[i]
-            edges_list = [combined[:n_added_out]]
-            total_edges = n_added_out
-            if n_added_out <= n_prev:
-                update_point_components(disjoint_set, point_components)
-                update_graph_components(distances, indices, indptr, point_components)
-                break
-        else:
-            total_edges += new_edges.shape[0]
+        # Step 3: grow CL with blocked pairs for next round's L1 filter
+        if n_blocked > 0:
+            cl_indptr, cl_indices = grow_cl_csr(
+                cl_indptr, cl_indices, blocked_u, blocked_v, n_blocked)
 
+        # Step 4: update component labels and prune same-component edges
         update_point_components(disjoint_set, point_components)
         update_graph_components(distances, indices, indptr, point_components)
         n_components -= new_edges.shape[0]
@@ -824,143 +911,55 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices, overwrite=Fa
     return n_components, point_components, result
 
 
-# ---------------------------------------------------------------------------
-# Entry-point utilities
-# ---------------------------------------------------------------------------
-
-def _pad_spanning_forest(edges, n_points):
-    """Pad a spanning forest to n-1 edges with inf-weight bridges."""
-    n_edges = edges.shape[0]
-    needed = n_points - 1
-    if n_edges >= needed:
-        return edges
-    parent = np.arange(n_points)
-
-    def _find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def _union(a, b):
-        ra, rb = _find(a), _find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for i in range(n_edges):
-        _union(int(edges[i, 0]), int(edges[i, 1]))
-    roots = sorted({_find(i) for i in range(n_points)})
-    bridges = [[float(roots[0]), float(roots[k]), np.inf] for k in range(1, len(roots))]
-    if bridges:
-        edges = np.vstack([edges, np.array(bridges, dtype=edges.dtype)])
-    return edges
-
-
-@numba.njit(cache=NUMBA_CACHE)
-def _has_cl_violation_csr(labels, cl_indptr, cl_indices, noise_label):
-    """Return True if any CL pair (i,j) has labels[i]==labels[j]!=noise_label."""
-    n = labels.shape[0]
-    for i in range(n):
-        li = labels[i]
-        if li == noise_label:
-            continue
-        for k in range(cl_indptr[i], cl_indptr[i + 1]):
-            j = cl_indices[k]
-            if j != i and labels[j] == li:
-                return True
-    return False
-
-
-def _pair_cannot_link_csr(i, j, cl_indptr, cl_indices):
-    """Return True if (i,j) is a CL pair in the CSR graph (either direction)."""
-    for k in range(int(cl_indptr[i]), int(cl_indptr[i + 1])):
-        if int(cl_indices[k]) == j:
-            return True
-    for k in range(int(cl_indptr[j]), int(cl_indptr[j + 1])):
-        if int(cl_indices[k]) == i:
-            return True
-    return False
-
-
-def _split_clusters_greedy(labels, cl_indptr, cl_indices, noise_label=-1):
-    """Greedy graph-coloring split for clusters with CL violations.
-
-    For each cluster, builds a conflict adjacency among its members,
-    sorts by descending conflict degree, and greedy-colors. Points with
-    color > 0 are assigned fresh labels.
-    """
-    labels_out = labels.astype(np.int64, copy=True)
-    next_label = int(labels_out.max()) + 1
-
-    for label_id in sorted(np.unique(labels_out).tolist()):
-        if label_id == noise_label:
-            continue
-        idx_points = np.flatnonzero(labels_out == label_id)
-        if idx_points.size <= 1:
-            continue
-
-        # Build conflict adjacency for this cluster
-        idx_list = idx_points.tolist()
-        adjacency = {i: [] for i in idx_list}
-        for a_i in range(len(idx_list)):
-            pi = idx_list[a_i]
-            for a_j in range(a_i + 1, len(idx_list)):
-                pj = idx_list[a_j]
-                if _pair_cannot_link_csr(pi, pj, cl_indptr, cl_indices):
-                    adjacency[pi].append(pj)
-                    adjacency[pj].append(pi)
-
-        if not any(len(v) > 0 for v in adjacency.values()):
-            continue
-
-        # Sort by descending conflict degree, then by index
-        order = sorted(idx_list, key=lambda n: (-len(adjacency[n]), n))
-
-        # Greedy graph-coloring
-        color_of = {}
-        for node in order:
-            used = {color_of[nbr] for nbr in adjacency[node] if nbr in color_of}
-            c = 0
-            while c in used:
-                c += 1
-            color_of[node] = c
-
-        colors = sorted(set(color_of.values()))
-        if len(colors) <= 1:
-            continue
-
-        for color in colors:
-            if color == 0:
-                continue
-            nodes = [n for n, c in color_of.items() if c == color]
-            labels_out[np.asarray(nodes, dtype=np.int64)] = next_label
-            next_label += 1
-
-    return labels_out
-
-
-def _apply_posthoc_cleanup(labels, n_points, cl_indptr, cl_indices):
-    """L3 post-hoc CL label splitting via greedy graph-coloring."""
-    labels_in = np.asarray(labels, dtype=np.int64)
-    cl_indptr_i64 = np.asarray(cl_indptr, dtype=np.int64)
-    cl_indices_i64 = np.asarray(cl_indices, dtype=np.int64)
-
-    if not _has_cl_violation_csr(labels_in, cl_indptr_i64, cl_indices_i64, -1):
-        return labels_in
-
-    return _split_clusters_greedy(labels_in, cl_indptr, cl_indices, noise_label=-1)
-
+# ===========================================================================
+# High-level entry point
+# ===========================================================================
 
 def constrained_hdbscan_from_boruvka(
         tree_or_X, n_threads, cl_indptr, cl_indices, *,
-        min_samples=10, min_cluster_size=10, posthoc_cleanup=True,
+        min_samples=10, min_cluster_size=10,
         sample_weights=None, reproducible=False, return_metadata=False,
         metric="euclidean"):
-    """Run constrained Borůvka MST → HDBSCAN with L1+L2+L3 CL enforcement.
+    """Run constrained HDBSCAN: Boruvka MST -> bridge -> cluster extraction.
 
-    metric='euclidean': tree_or_X is a NumbaKDTree → parallel_boruvka.
-    metric='precomputed': tree_or_X is a scipy sparse CSR → graph-Borůvka.
-    Returns (labels, probs, edges) or (labels, probs, edges, metadata).
+    Builds a constrained MST/MSF using preventive DSU checks (no L2/L3 needed).
+    Disconnected components are bridged with +inf edges so that cluster_trees.py
+    receives exactly n-1 edges.  The lambda=0 logic in get_cluster_label_vector
+    prevents cross-component cluster absorption.
+
+    Clustering follows the same pipeline as kruskal.py:
+      1. Build MST/MSF with CL enforcement
+      2. Bridge disconnected components with bridge_forest_with_inf
+      3. Pass n-1 edges to clusters_from_spanning_tree for extraction
+
+    Parameters
+    ----------
+    tree_or_X : NumbaKDTree or scipy.sparse matrix
+        metric='euclidean': NumbaKDTree from build_kdtree.
+        metric='precomputed': scipy sparse CSR distance matrix.
+    n_threads : int
+        Thread count for parallel Boruvka.
+    cl_indptr : int64[:] -- CSR row pointers for CL graph.
+    cl_indices : int32[:] -- CSR column indices for CL graph.
+    min_samples : int
+        Core distance parameter.
+    min_cluster_size : int
+        Minimum cluster size for HDBSCAN.
+    sample_weights : float32[:] or None
+        Per-point sample weights.
+    reproducible : bool
+        If True, use block-based deterministic queries (KD-tree path only).
+    return_metadata : bool
+        If True, return additional metadata dict.
+    metric : str
+        'euclidean' (KD-tree) or 'precomputed' (sparse CSR).
+
+    Returns
+    -------
+    labels : int64[:]
+    probs : float64[:]
+    edges : float64[:, 3]
+    metadata : dict (only if return_metadata=True)
     """
     if metric == "euclidean":
         tree = tree_or_X
@@ -969,40 +968,64 @@ def constrained_hdbscan_from_boruvka(
             tree, n_threads, min_samples=min_samples,
             sample_weights=sample_weights, reproducible=reproducible,
             cl_indptr=cl_indptr, cl_indices=cl_indices)
+
     elif metric == "precomputed":
+        from .precomputed import (
+            _symmetrize_min_csr, _core_distances_csr,
+            _build_core_graph_csr, _patch_mst_weights,
+        )
         X = tree_or_X
         validate_precomputed_sparse_graph(X)
         n_points = X.shape[0]
-        undirected_edges = extract_undirected_min_edges(X)
-        adjacency = build_adjacency_lists(n_points, undirected_edges)
-        neighbors, core_dists_raw = compute_sparse_core_distances(adjacency, min_samples)
-        mrd_edges = apply_mutual_reachability(undirected_edges, core_dists_raw)
-        core_graph = to_core_graph_arrays(n_points, mrd_edges)
-        n_comp, comp_labels, edges = minimum_spanning_tree_constrained(
+
+        # 1. Symmetrize: min weight per undirected pair, no diagonal
+        X_sym = _symmetrize_min_csr(X)
+
+        # 2. Core distances and nearest-neighbor indices (parallel over nodes)
+        nbrs, core_dists_f64 = _core_distances_csr(
+            X_sym.data, X_sym.indices, X_sym.indptr, min_samples)
+
+        # 3. Build CoreGraph with MRD weights, sorted per row (parallel)
+        weights, distances, cg_indices = _build_core_graph_csr(
+            X_sym.data, X_sym.indices, X_sym.indptr, core_dists_f64)
+        core_graph = CoreGraph(weights, distances, cg_indices, X_sym.indptr)
+
+        # 4. Constrained graph-Boruvka MST (same DSU-check strategy as KD-tree)
+        n_components, component_labels, edges = minimum_spanning_tree_constrained(
             core_graph, cl_indptr, cl_indices)
-        n_rounds, n_viols = 0, 0
+
+        # 5. Bridge disconnected components with +inf edges
+        if n_components > 1:
+            edges = bridge_forest_with_inf(edges, component_labels, n_points)
+
+        # 6. Restore float64 precision for MRD weights
+        mst_weights = _patch_mst_weights(
+            edges, X_sym.data, X_sym.indices, X_sym.indptr, core_dists_f64)
+        edges = np.column_stack([edges[:, :2], mst_weights])
+
+        n_rounds = np.int64(0)
+        n_viols = np.int64(0)
+
     else:
         raise ValueError(f"Unsupported metric: {metric!r}. Expected 'euclidean' or 'precomputed'.")
 
-    # Pad spanning forest → full spanning tree
-    edges = _pad_spanning_forest(edges, n_points)
+    # -- Bridge MSF -> MST (KD-tree path; precomputed path bridges above) --
+    if metric == "euclidean" and edges.shape[0] < n_points - 1:
+        _ds = ds_rank_create(n_points)
+        for _ei in range(edges.shape[0]):
+            _a, _b = int(edges[_ei, 0]), int(edges[_ei, 1])
+            _ra, _rb = int(ds_find(_ds, _a)), int(ds_find(_ds, _b))
+            if _ra != _rb:
+                ds_union_by_rank(_ds, _ra, _rb)
+        component_labels = np.array(
+            [int(ds_find(_ds, i)) for i in range(n_points)], dtype=np.int32)
+        _, component_labels = np.unique(component_labels, return_inverse=True)
+        component_labels = component_labels.astype(np.int32)
+        edges = bridge_forest_with_inf(edges, component_labels, n_points)
 
-    # Replace inf with large finite penalty for cluster extraction
-    finite_vals = edges[:, 2][np.isfinite(edges[:, 2])]
-    if finite_vals.size > 0:
-        penalty = float(np.percentile(finite_vals, 99.9) * 1e6 + 1.0)
-    else:
-        penalty = 1e6
-    bad = ~np.isfinite(edges[:, 2])
-    if np.any(bad):
-        edges = edges.copy()
-        edges[bad, 2] = penalty
-
+    # -- Cluster extraction (same pipeline as kruskal.py) --
     labels, probs, *_ = clusters_from_spanning_tree(
         edges, min_cluster_size=min_cluster_size)
-
-    if posthoc_cleanup and cl_indptr.shape[0] > 1:
-        labels = _apply_posthoc_cleanup(labels, n_points, cl_indptr, cl_indices)
 
     if return_metadata:
         return labels, probs, edges, {
