@@ -65,6 +65,17 @@ from .core_graph import CoreGraph, update_point_components, update_graph_compone
 from .precomputed import (
     validate_precomputed_sparse_graph,
     bridge_forest_with_inf,
+    _symmetrize_min_csr,
+    _core_distances_csr,
+    _build_core_graph_csr,
+    _patch_mst_weights,
+)
+
+# -- Pynndescent (arbitrary metric) imports --
+from .nndescent import (
+    _check_pynndescent_available,
+    build_knn_graph,
+    _knn_graph_to_sparse,
 )
 
 # -- Clustering pipeline --
@@ -255,18 +266,20 @@ def expand_cl(cl_bitset, blocked_u, blocked_v, n_blocked):
 def merge_components(disjoint_set, candidate_neighbors, candidate_neighbor_distances,
                      point_components, head, tail, next_node,
                      cl_bitset):
-    """Mini-Kruskal merge: select per-component best, sort by weight, merge lightest-first.
+    """Mini-Kruskal merge with multi-candidate fallback.
 
-    Uses multiple passes over the candidate array.  On each pass:
-      1. Find the cheapest remaining cross-component edge per unfinished component.
-      2. Collect all proposals into a flat list and ARGSORT BY WEIGHT (the
-         mini-Kruskal step).  Processing lightest-first ensures that when
-         multiple components compete for the same merge target, the lighter
-         edge wins -- mimicking Kruskal's greedy ordering within each Borůvka
-         round.
-      3. Process in sorted order: WOULD_VIOLATE check, accept or block.
-      4. Blocked edges are invalidated (distance set to inf) so the next
-         pass automatically promotes the component's next-cheapest candidate.
+    Accepts 2-D candidate arrays (n_points × K) where K is the number of
+    fallback candidates per point from the KD-tree query.  Candidates are
+    sorted per-point by distance so that when a merge is CL-blocked, the
+    pointer advances to the next-cheapest candidate *without* a full
+    re-query of the KD-tree.
+
+    On each pass:
+      1. For each point, find its cheapest *unused* cross-component candidate
+         (scanning from ``cand_ptr[i]``).
+      2. Collect per-component bests, ARGSORT BY WEIGHT (mini-Kruskal).
+      3. Process lightest-first: preventive CL check, accept or block.
+      4. Blocked → advance ``cand_ptr[src]`` so next pass uses next candidate.
 
     Returns
     -------
@@ -275,50 +288,64 @@ def merge_components(disjoint_set, candidate_neighbors, candidate_neighbor_dista
     n_blocked : int32
     """
     n_points = candidate_neighbors.shape[0]
+    num_candidates = candidate_neighbors.shape[1]
 
-    # Work on a copy so we can invalidate blocked edges
-    cand_dist = candidate_neighbor_distances.copy()
+    # Sort each point's K candidates by distance ascending (heap is max-heap)
+    sorted_dist = np.empty((n_points, num_candidates), dtype=np.float32)
+    sorted_idx  = np.empty((n_points, num_candidates), dtype=np.int32)
+    for i in range(n_points):
+        order = np.argsort(candidate_neighbor_distances[i])
+        for k in range(num_candidates):
+            sorted_dist[i, k] = candidate_neighbor_distances[i, order[k]]
+            sorted_idx[i, k]  = candidate_neighbors[i, order[k]]
+
+    # Per-point pointer: index of next candidate to consider
+    cand_ptr = np.zeros(n_points, dtype=np.int32)
 
     component_done = np.zeros(n_points, dtype=numba.boolean)
     result = np.empty((n_points, 3), dtype=np.float64)
-    blocked_u = np.empty(n_points, dtype=np.int32)
-    blocked_v = np.empty(n_points, dtype=np.int32)
+    blocked_u = np.empty(n_points * num_candidates, dtype=np.int32)
+    blocked_v = np.empty(n_points * num_candidates, dtype=np.int32)
     result_idx = np.int32(0)
     blocked_idx = np.int32(0)
 
-    # Flat arrays indexed by component ID (faster than typed dict)
+    # Flat arrays indexed by component ID
     best_dist = np.empty(n_points, dtype=np.float32)
     best_src = np.empty(n_points, dtype=np.int32)
     best_dst = np.empty(n_points, dtype=np.int32)
 
-    # Proposal arrays for sorting (at most n_points proposals per pass)
+    # Proposal arrays for sorting
     prop_wt = np.empty(n_points, dtype=np.float32)
     prop_src = np.empty(n_points, dtype=np.int32)
     prop_dst = np.empty(n_points, dtype=np.int32)
     prop_comp = np.empty(n_points, dtype=np.int32)
 
-    max_passes = np.int32(5)  # small cap; outer loop handles rest
+    max_passes = np.int32(5)
     for _pass in range(max_passes):
         # Reset per-component best
         for i in range(n_points):
             best_dist[i] = np.float32(np.inf)
             best_src[i] = np.int32(-1)
 
-        # Find cheapest valid edge per unfinished component
+        # Find cheapest valid cross-component candidate per component.
+        # Each point scans from its cand_ptr to the first valid candidate.
         for i in range(n_points):
             comp = point_components[i]
             if component_done[comp]:
                 continue
-            d = cand_dist[i]
-            j = candidate_neighbors[i]
-            if j < 0 or np.isnan(d) or d == np.inf:
-                continue
-            if point_components[j] == comp:
-                continue
-            if d < best_dist[comp]:
-                best_dist[comp] = d
-                best_src[comp] = np.int32(i)
-                best_dst[comp] = np.int32(j)
+            for kk in range(cand_ptr[i], num_candidates):
+                j = sorted_idx[i, kk]
+                d = sorted_dist[i, kk]
+                if j < 0 or d >= np.float32(np.inf):
+                    break  # no more valid candidates for this point
+                if point_components[j] == comp:
+                    continue  # same component after earlier merge; skip
+                # First valid cross-component candidate for this point
+                if d < best_dist[comp]:
+                    best_dist[comp] = d
+                    best_src[comp] = np.int32(i)
+                    best_dst[comp] = np.int32(j)
+                break  # only use first valid candidate per point
 
         # Collect active proposals into flat arrays
         n_proposals = np.int32(0)
@@ -360,7 +387,7 @@ def merge_components(disjoint_set, candidate_neighbors, candidate_neighbor_dista
                     blocked_u[blocked_idx] = src
                     blocked_v[blocked_idx] = dst
                     blocked_idx += 1
-                    cand_dist[src] = np.float32(np.inf)
+                    cand_ptr[src] += np.int32(1)  # advance to next candidate
                     had_block = True
                     continue
 
@@ -486,20 +513,23 @@ def component_aware_query_recursion(
     parallel=True, cache=NUMBA_CACHE, fastmath=True,
 )
 def boruvka_tree_query(tree, node_components, point_components, core_distances,
-                       cl_bitset):
-    """Parallel KD-tree query: find each point's cheapest cross-component neighbor.
+                       cl_bitset, num_candidates):
+    """Parallel KD-tree query: find each point's top-K cross-component neighbors.
 
-    Runs component_aware_query_recursion in parallel over all points.
-    L1 CL filtering uses the bitset for O(1) checks.
+    Returns 2-D arrays of shape (n_points, num_candidates) so that the merge
+    step has fallback candidates when the best is CL-blocked.  This avoids
+    the expensive full re-query that previously caused ~27 000 rounds.
     """
-    candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
-    candidate_indices = np.full(tree.data.shape[0], -1, dtype=np.int32)
-    component_nearest_neighbor_dist = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
+    n_points = tree.data.shape[0]
+    candidate_distances = np.full((n_points, num_candidates), np.inf, dtype=np.float32)
+    candidate_indices = np.full((n_points, num_candidates), np.int32(-1), dtype=np.int32)
+    component_nearest_neighbor_dist = np.full(n_points, np.inf, dtype=np.float32)
     data = tree.data.astype(np.float32)
-    for i in numba.prange(tree.data.shape[0]):
+    for i in numba.prange(n_points):
         distance_lower_bound = point_to_node_lower_bound_rdist(
             tree.node_bounds[0, 0], tree.node_bounds[1, 0], tree.data[i])
-        heap_p, heap_i = candidate_distances[i:i+1], candidate_indices[i:i+1]
+        heap_p = candidate_distances[i]   # 1-D slice of size K (max-heap)
+        heap_i = candidate_indices[i]     # 1-D slice of size K
         component_aware_query_recursion(
             tree, 0, data[i], heap_p, heap_i,
             core_distances[i], core_distances,
@@ -520,26 +550,29 @@ def boruvka_tree_query(tree, node_components, point_components, core_distances,
     parallel=True, cache=NUMBA_CACHE, fastmath=True,
 )
 def boruvka_tree_query_reproducible(tree, node_components, point_components,
-                                    core_distances, block_size, cl_bitset):
-    """Block-based reproducible KD-tree query with L1 CL filtering via bitset.
+                                    core_distances, block_size, cl_bitset,
+                                    num_candidates):
+    """Block-based reproducible KD-tree query returning top-K candidates.
 
-    Processes points in blocks to avoid race conditions on the shared
-    component_nearest_neighbor_dist array.  Within each block, points are
-    processed in parallel; between blocks, bounds are merged sequentially.
+    Same as boruvka_tree_query but processes points in blocks to avoid
+    race conditions on the shared component_nearest_neighbor_dist array.
+    Returns 2-D arrays of shape (n_points, num_candidates).
     """
-    candidate_distances = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
-    candidate_indices = np.full(tree.data.shape[0], -1, dtype=np.int32)
-    component_nearest_neighbor_dist = np.full(tree.data.shape[0], np.inf, dtype=np.float32)
+    n_points = tree.data.shape[0]
+    candidate_distances = np.full((n_points, num_candidates), np.inf, dtype=np.float32)
+    candidate_indices = np.full((n_points, num_candidates), np.int32(-1), dtype=np.int32)
+    component_nearest_neighbor_dist = np.full(n_points, np.inf, dtype=np.float32)
     data = tree.data.astype(np.float32)
     max_block_component_bounds = np.full(block_size, np.inf, dtype=np.float32)
-    for block_start in range(0, tree.data.shape[0], block_size):
-        block_end = min(block_start + block_size, tree.data.shape[0])
+    for block_start in range(0, n_points, block_size):
+        block_end = min(block_start + block_size, n_points)
         block_size_actual = block_end - block_start
         max_block_component_bounds[:block_size_actual] = np.inf
         for i in numba.prange(block_start, block_end):
             distance_lower_bound = point_to_node_lower_bound_rdist(
                 tree.node_bounds[0, 0], tree.node_bounds[1, 0], tree.data[i])
-            heap_p, heap_i = candidate_distances[i:i+1], candidate_indices[i:i+1]
+            heap_p = candidate_distances[i]   # 1-D slice of size K
+            heap_i = candidate_indices[i]     # 1-D slice of size K
             current_component = point_components[i]
             local_component_bound = component_nearest_neighbor_dist[
                 current_component:current_component+1]
@@ -625,7 +658,8 @@ def initialize_boruvka_from_knn(knn_indices, knn_distances, core_distances,
 
 @numba.njit(cache=NUMBA_CACHE)
 def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
-                     reproducible=False, cl_indptr=None, cl_indices=None):
+                     reproducible=False, cl_indptr=None, cl_indices=None,
+                     num_candidates=16):
     """Build constrained MST via parallel Boruvka on a KD-tree.
 
     This is the main entry point for the KD-tree (euclidean) path.
@@ -649,6 +683,11 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
         CSR row pointers for CL graph.  None = no constraints.
     cl_indices : int32[:] or None
         CSR column indices for CL graph.  None = no constraints.
+    num_candidates : int
+        Number of fallback candidates per point in each KD-tree query
+        round.  Higher values reduce the number of expensive re-query
+        rounds when candidates are CL-blocked, at the cost of slightly
+        wider tree exploration per round.  Default 16.
 
     Returns
     -------
@@ -713,11 +752,11 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
             block_size = calculate_block_size(n_components, n_points, n_threads)
             candidate_distances, candidate_indices = boruvka_tree_query_reproducible(
                 tree, node_components, point_components, core_distances,
-                block_size, cl_bitset)
+                block_size, cl_bitset, num_candidates)
         else:
             candidate_distances, candidate_indices = boruvka_tree_query(
                 tree, node_components, point_components, core_distances,
-                cl_bitset)
+                cl_bitset, num_candidates)
 
         # Step 2: merge with preventive CL check + multi-pass fallback
         (new_edges, blocked_u, blocked_v,
@@ -993,7 +1032,8 @@ def constrained_hdbscan_from_boruvka(
         tree_or_X, n_threads, cl_indptr, cl_indices, *,
         min_samples=10, min_cluster_size=10,
         sample_weights=None, reproducible=False, return_metadata=False,
-        metric="euclidean"):
+        metric="euclidean", metric_kwds=None, knn_k=None,
+        num_candidates=16):
     """Run constrained HDBSCAN: Boruvka MST -> bridge -> cluster extraction.
 
     Builds a constrained MST/MSF using:
@@ -1008,9 +1048,10 @@ def constrained_hdbscan_from_boruvka(
 
     Parameters
     ----------
-    tree_or_X : NumbaKDTree or scipy.sparse matrix
+    tree_or_X : NumbaKDTree, scipy.sparse matrix, or ndarray
         metric='euclidean': NumbaKDTree from build_kdtree.
         metric='precomputed': scipy sparse CSR distance matrix.
+        Any other metric: dense feature matrix (n_samples, n_features).
     n_threads : int
         Thread count for parallel Boruvka.
     cl_indptr : int64[:] -- CSR row pointers for CL graph.
@@ -1026,7 +1067,15 @@ def constrained_hdbscan_from_boruvka(
     return_metadata : bool
         If True, return additional metadata dict.
     metric : str
-        'euclidean' (KD-tree) or 'precomputed' (sparse CSR).
+        'euclidean' (KD-tree), 'precomputed' (sparse CSR), or any metric
+        supported by pynndescent (e.g. 'cosine', 'manhattan', 'minkowski',
+        'haversine', 'hamming', 'jaccard', 'correlation', etc.).
+    metric_kwds : dict or None
+        Additional keyword arguments for the distance metric (pynndescent only).
+        For example, ``metric_kwds={'p': 3}`` for Minkowski.
+    knn_k : int or None
+        Number of neighbors for the KNN graph (pynndescent metrics only).
+        If None, defaults to max(3 * min_samples, 15).
 
     Returns
     -------
@@ -1041,13 +1090,10 @@ def constrained_hdbscan_from_boruvka(
         edges, nbrs, core_dists, n_rounds, n_viols = parallel_boruvka(
             tree, n_threads, min_samples=min_samples,
             sample_weights=sample_weights, reproducible=reproducible,
-            cl_indptr=cl_indptr, cl_indices=cl_indices)
+            cl_indptr=cl_indptr, cl_indices=cl_indices,
+            num_candidates=num_candidates)
 
     elif metric == "precomputed":
-        from .precomputed import (
-            _symmetrize_min_csr, _core_distances_csr,
-            _build_core_graph_csr, _patch_mst_weights,
-        )
         X = tree_or_X
         validate_precomputed_sparse_graph(X)
         n_points = X.shape[0]
@@ -1081,7 +1127,49 @@ def constrained_hdbscan_from_boruvka(
         n_viols = np.int64(0)
 
     else:
-        raise ValueError(f"Unsupported metric: {metric!r}. Expected 'euclidean' or 'precomputed'.")
+        # ----- Arbitrary metric via pynndescent KNN graph -----
+        # Build a KNN graph using pynndescent, convert to sparse CSR,
+        # then feed into the precomputed constrained Boruvka path.
+        _check_pynndescent_available()
+
+        X = np.asarray(tree_or_X)
+        n_points = X.shape[0]
+
+        # Determine KNN k
+        _knn_k = knn_k if knn_k is not None else max(3 * min_samples, 15)
+        _knn_k = max(_knn_k, min_samples)
+
+        # Build approximate KNN graph via pynndescent
+        _nnd_index, knn_indices, knn_distances = build_knn_graph(
+            X, _knn_k, metric=metric, metric_kwds=metric_kwds)
+
+        # Convert KNN graph to symmetric sparse CSR distance matrix
+        X_sym = _knn_graph_to_sparse(knn_indices, knn_distances, n_points)
+
+        # Core distances and nearest-neighbor indices
+        nbrs, core_dists_f64 = _core_distances_csr(
+            X_sym.data, X_sym.indices, X_sym.indptr, min_samples)
+
+        # Build CoreGraph with MRD weights, sorted per row
+        weights, distances, cg_indices = _build_core_graph_csr(
+            X_sym.data, X_sym.indices, X_sym.indptr, core_dists_f64)
+        core_graph = CoreGraph(weights, distances, cg_indices, X_sym.indptr)
+
+        # Constrained graph-Boruvka MST
+        n_components, component_labels, edges = minimum_spanning_tree_constrained(
+            core_graph, cl_indptr, cl_indices)
+
+        # Bridge disconnected components with +inf edges
+        if n_components > 1:
+            edges = bridge_forest_with_inf(edges, component_labels, n_points)
+
+        # Restore float64 precision for MRD weights
+        mst_weights = _patch_mst_weights(
+            edges, X_sym.data, X_sym.indices, X_sym.indptr, core_dists_f64)
+        edges = np.column_stack([edges[:, :2], mst_weights])
+
+        n_rounds = np.int64(0)
+        n_viols = np.int64(0)
 
     # -- Bridge MSF -> MST (KD-tree path; precomputed path bridges above) --
     if metric == "euclidean" and edges.shape[0] < n_points - 1:
