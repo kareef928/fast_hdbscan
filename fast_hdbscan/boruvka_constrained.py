@@ -791,35 +791,35 @@ def parallel_boruvka(tree, n_threads, min_samples=10, sample_weights=None,
 # candidates per point and process them in a single global mini-Kruskal
 # pass, eliminating the inner retry loop.
 
-@numba.njit(locals={"parent": numba.types.int32}, cache=NUMBA_CACHE)
+@numba.njit(locals={"parent": numba.types.int32}, parallel=True, cache=NUMBA_CACHE)
 def select_k_candidates_constrained(distances, indices, indptr, point_components,
-                                     cl_bitset, cand_ptr, K):
+                                     cl_bitset, K):
     """Collect up to K valid cross-component non-CL candidates per point.
 
-    Each point scans its CSR row from ``cand_ptr[point]``, collecting up to K
+    Each point scans its CSR row from the beginning, collecting up to K
     cross-component neighbors that pass L1 CL filtering.  Since CSR rows are
     sorted by MRD weight ascending (from ``_build_core_graph_csr``), the K
     candidates are already in ascending weight order -- no per-point argsort.
+
+    Runs in parallel across all points via ``numba.prange``.
 
     Returns
     -------
     cand_weights : float32[n_points, K] -- candidate MRD weights (inf = empty)
     cand_dsts    : int32[n_points, K]   -- candidate destinations (-1 = empty)
-    cand_offsets : int32[n_points, K]   -- CSR-row offsets for pointer advancement
     cand_count   : int32[n_points]      -- number of valid candidates per point
     """
     n_points = len(point_components)
     cand_weights = np.full((n_points, K), np.float32(np.inf), dtype=np.float32)
     cand_dsts = np.full((n_points, K), np.int32(-1), dtype=np.int32)
-    cand_offsets = np.full((n_points, K), np.int32(-1), dtype=np.int32)
     cand_count = np.zeros(n_points, dtype=np.int32)
 
-    for parent in range(n_points):
+    for parent in numba.prange(n_points):
         from_component = point_components[parent]
         start = indptr[parent]
         end = indptr[parent + 1] if parent + 1 < len(indptr) else len(indices)
         k_found = np.int32(0)
-        for idx in range(start + cand_ptr[parent], end):
+        for idx in range(start, end):
             if k_found >= K:
                 break
             if indices[idx] == -1:
@@ -837,33 +837,30 @@ def select_k_candidates_constrained(distances, indices, indptr, point_components
             # Valid candidate -- store in slot k_found
             cand_weights[parent, k_found] = np.float32(distance)
             cand_dsts[parent, k_found] = neighbor
-            cand_offsets[parent, k_found] = np.int32(idx - start)
             k_found += np.int32(1)
         cand_count[parent] = k_found
-    return cand_weights, cand_dsts, cand_offsets, cand_count
+    return cand_weights, cand_dsts, cand_count
 
 
 @numba.njit(cache=NUMBA_CACHE)
-def merge_k_candidates_constrained(disjoint_set,
-                                    cand_weights, cand_dsts, cand_offsets,
-                                    cand_count, cand_ptr,
-                                    head, tail, next_node,
-                                    cl_bitset):
-    """K-candidate global mini-Kruskal merge for the precomputed path.
+def merge_per_component(disjoint_set,
+                        cand_weights, cand_dsts, cand_count,
+                        point_components,
+                        head, tail, next_node,
+                        cl_bitset):
+    """Per-component merge with K-fallback and both-sides guard.
 
-    Flattens ALL N×K candidate proposals into a single 1-D array, sorts
-    globally by weight (ascending), and processes lightest-first.  This
-    eliminates the per-component min-reduction that killed proposal
-    diversity -- every candidate from every point participates in the
-    global sort, so a viable-but-slightly-heavier proposal from one point
-    is immediately available when a cheaper-but-doomed proposal from
-    another point in the same component is blocked.
-
-    Because all K candidates per point are already in the sorted queue,
-    there is no need for an inner retry loop.  Blocked proposals simply
-    advance ``cand_ptr[src]`` for the next round's select, while the
-    remaining candidates for that point are processed at their natural
-    weight positions in the same pass.
+    Phase A: Build component→members mapping from *point_components*.
+    Phase B: For each component, gather its members' candidates and sort
+             by weight.  Record each component's lightest candidate weight.
+    Phase C: Sort components by lightest candidate weight (O(C log C)).
+    Phase D: Process components lightest-first.  For each component, scan
+             its sorted candidate list:
+               - Skip if source or target already merged this round
+                 (both-sides *comp_merged* guard).
+               - CL check via *check_merge_violates*.
+               - On block: record blocked pair, K-fallback to next candidate.
+               - On valid: accept edge, union, mark *comp_merged*, BREAK.
 
     Returns
     -------
@@ -874,7 +871,41 @@ def merge_k_candidates_constrained(disjoint_set,
     n_points = cand_weights.shape[0]
     K = cand_weights.shape[1]
 
-    # Count total valid proposals across all points
+    # ── Phase A: Build component → members mapping (O(N)) ────────────
+    # Count points per component
+    comp_size = np.zeros(n_points, dtype=np.int32)
+    for i in range(n_points):
+        comp_size[point_components[i]] += np.int32(1)
+
+    # Collect unique component IDs
+    n_unique = np.int32(0)
+    for i in range(n_points):
+        if comp_size[i] > 0:
+            n_unique += np.int32(1)
+    unique_comps = np.empty(n_unique, dtype=np.int32)
+    ui = np.int32(0)
+    for i in range(n_points):
+        if comp_size[i] > 0:
+            unique_comps[ui] = np.int32(i)
+            ui += np.int32(1)
+
+    # Prefix sum for offsets
+    comp_start = np.zeros(n_points, dtype=np.int32)
+    running = np.int32(0)
+    for i in range(n_points):
+        comp_start[i] = running
+        running += comp_size[i]
+
+    # Fill comp_members (flat array, each component's points packed contiguously)
+    comp_fill = np.zeros(n_points, dtype=np.int32)  # per-comp fill cursor
+    comp_members = np.empty(n_points, dtype=np.int32)
+    for i in range(n_points):
+        c = point_components[i]
+        comp_members[comp_start[c] + comp_fill[c]] = np.int32(i)
+        comp_fill[c] += np.int32(1)
+
+    # ── Phase B: Per-component candidate gathering + sorting ─────────
+    # Count total candidates across all points (for pre-allocation)
     n_total = np.int32(0)
     for i in range(n_points):
         n_total += cand_count[i]
@@ -884,63 +915,121 @@ def merge_k_candidates_constrained(disjoint_set,
         empty_blocked = np.empty(0, dtype=np.int32)
         return empty_edges, empty_blocked, empty_blocked, np.int32(0)
 
-    # Flatten N×K proposals into 1-D arrays
-    flat_wt = np.empty(n_total, dtype=np.float32)
-    flat_src = np.empty(n_total, dtype=np.int32)
-    flat_dst = np.empty(n_total, dtype=np.int32)
-    flat_offset = np.empty(n_total, dtype=np.int32)
-    fi = np.int32(0)
-    for point in range(n_points):
-        for k in range(cand_count[point]):
-            flat_wt[fi] = cand_weights[point, k]
-            flat_src[fi] = np.int32(point)
-            flat_dst[fi] = cand_dsts[point, k]
-            flat_offset[fi] = cand_offsets[point, k]
-            fi += np.int32(1)
+    # For each component: gather candidates, argsort, store sorted list.
+    # We use a single flat buffer for all per-component sorted candidates.
+    all_cand_wt = np.empty(n_total, dtype=np.float32)
+    all_cand_src = np.empty(n_total, dtype=np.int32)
+    all_cand_dst = np.empty(n_total, dtype=np.int32)
+    # Per-component: start index into all_cand_* and count
+    pc_start = np.zeros(n_unique, dtype=np.int32)
+    pc_count = np.zeros(n_unique, dtype=np.int32)
+    # Lightest candidate weight per component (for Phase C sorting)
+    comp_lightest = np.full(n_unique, np.float32(np.inf), dtype=np.float32)
 
-    # ── GLOBAL MINI-KRUSKAL: sort ALL proposals by weight ascending ──
-    sorted_order = np.argsort(flat_wt[:n_total])
+    fill = np.int32(0)
+    for ci in range(n_unique):
+        comp_id = unique_comps[ci]
+        m_start = comp_start[comp_id]
+        m_count = comp_size[comp_id]
 
-    # Preallocate result arrays
-    result = np.empty((n_total, 3), dtype=np.float64)
+        # Count total candidates for this component's members
+        comp_n_cand = np.int32(0)
+        for mi in range(m_count):
+            pt = comp_members[m_start + mi]
+            comp_n_cand += cand_count[pt]
+
+        pc_start[ci] = fill
+        pc_count[ci] = comp_n_cand
+
+        if comp_n_cand == 0:
+            continue
+
+        # Gather into temp arrays for sorting
+        tmp_wt = np.empty(comp_n_cand, dtype=np.float32)
+        tmp_src = np.empty(comp_n_cand, dtype=np.int32)
+        tmp_dst = np.empty(comp_n_cand, dtype=np.int32)
+        ti = np.int32(0)
+        for mi in range(m_count):
+            pt = comp_members[m_start + mi]
+            for k in range(cand_count[pt]):
+                tmp_wt[ti] = cand_weights[pt, k]
+                tmp_src[ti] = np.int32(pt)
+                tmp_dst[ti] = cand_dsts[pt, k]
+                ti += np.int32(1)
+
+        # Sort by weight within this component
+        order = np.argsort(tmp_wt)
+        for si in range(comp_n_cand):
+            oi = order[si]
+            all_cand_wt[fill + si] = tmp_wt[oi]
+            all_cand_src[fill + si] = tmp_src[oi]
+            all_cand_dst[fill + si] = tmp_dst[oi]
+
+        comp_lightest[ci] = all_cand_wt[fill]  # lightest after sort
+        fill += comp_n_cand
+
+    # ── Phase C: Sort components by lightest candidate weight ────────
+    comp_order = np.argsort(comp_lightest)
+
+    # ── Phase D: Process components lightest-first ───────────────────
+    comp_merged = np.zeros(n_points, dtype=numba.boolean)
+
+    # Preallocate result arrays (upper bound: n_unique merges)
+    result = np.empty((n_unique, 3), dtype=np.float64)
     blocked_u = np.empty(n_total, dtype=np.int32)
     blocked_v = np.empty(n_total, dtype=np.int32)
     result_idx = np.int32(0)
     blocked_idx = np.int32(0)
 
-    # Process proposals lightest-first
-    for si in range(n_total):
-        pi = sorted_order[si]
-        src = flat_src[pi]
-        dst = flat_dst[pi]
-
-        from_component = ds_find(disjoint_set, src)
-        to_component = ds_find(disjoint_set, dst)
-        if from_component == to_component:
+    for oi in range(n_unique):
+        ci = comp_order[oi]
+        if pc_count[ci] == 0:
             continue
 
-        # -- Preventive CL check (bitset cross-walk) --
-        if cl_bitset.shape[0] > 0:
-            if check_merge_violates(from_component, to_component,
-                                    head, next_node, cl_bitset):
-                blocked_u[blocked_idx] = src
-                blocked_v[blocked_idx] = dst
-                blocked_idx += np.int32(1)
-                # Advance source point's CSR pointer past rejected candidate
-                if flat_offset[pi] >= 0:
-                    new_ptr = flat_offset[pi] + np.int32(1)
-                    if new_ptr > cand_ptr[src]:
-                        cand_ptr[src] = new_ptr
+        # Check if this component was already absorbed as a target
+        comp_id = unique_comps[ci]
+        root_c = ds_find(disjoint_set, comp_id)
+        if comp_merged[root_c]:
+            continue
+
+        # Scan this component's sorted candidate list (K-fallback)
+        cstart = pc_start[ci]
+        ccount = pc_count[ci]
+        for si in range(ccount):
+            src = all_cand_src[cstart + si]
+            dst = all_cand_dst[cstart + si]
+            wt = all_cand_wt[cstart + si]
+
+            root_src = ds_find(disjoint_set, src)
+            root_dst = ds_find(disjoint_set, dst)
+
+            # Same component now (merged by earlier processing)
+            if root_src == root_dst:
                 continue
 
-        # -- Accept merge (no redundant ds_find -- already checked above) --
-        result[result_idx] = (np.float64(src), np.float64(dst),
-                              np.float64(flat_wt[pi]))
-        result_idx += np.int32(1)
-        ds_union_by_rank(disjoint_set, from_component, to_component)
-        new_root = ds_find(disjoint_set, from_component)
-        loser = to_component if new_root == from_component else from_component
-        linked_list_merge(head, tail, next_node, new_root, loser)
+            # Both-sides guard: target already merged this round
+            if comp_merged[root_dst]:
+                continue
+
+            # Preventive CL check (bitset cross-walk)
+            if cl_bitset.shape[0] > 0:
+                if check_merge_violates(root_src, root_dst,
+                                        head, next_node, cl_bitset):
+                    blocked_u[blocked_idx] = src
+                    blocked_v[blocked_idx] = dst
+                    blocked_idx += np.int32(1)
+                    continue  # K-fallback: try next candidate
+
+            # Accept merge
+            result[result_idx] = (np.float64(src), np.float64(dst),
+                                  np.float64(wt))
+            result_idx += np.int32(1)
+            ds_union_by_rank(disjoint_set, root_src, root_dst)
+            new_root = ds_find(disjoint_set, root_src)
+            loser = root_dst if new_root == root_src else root_src
+            linked_list_merge(head, tail, next_node, new_root, loser)
+            comp_merged[new_root] = True
+            break  # early stop: this component is done for the round
 
     return (result[:result_idx],
             blocked_u[:blocked_idx], blocked_v[:blocked_idx], blocked_idx)
@@ -951,22 +1040,19 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
                                       overwrite=False, K=8):
     """Constrained graph-Borůvka MST on a CoreGraph (precomputed path).
 
-    Uses K-candidate per-point selection with global mini-Kruskal merge,
-    eliminating the inner retry loop that plagued the single-candidate
-    design.  Each round:
-      1. Reset cand_ptr (CSR rows are compacted between rounds)
-      2. select_k: Collect K cross-component non-CL candidates per point
-      3. merge_k:  Flatten N×K proposals, global argsort, process lightest-first
-      4. expand_cl: Record blocked pairs in bitset
-      5. Compact CSR rows (prune same-component edges)
-
-    With K candidates per point already in the sorted queue, blocked
-    proposals simply fall through to the next candidate at its natural
-    weight position -- no per-component min-reduction, no inner retry.
+    Uses K-candidate per-point selection with per-component merge,
+    K-fallback, and both-sides comp_merged guard.  Each round:
+      1. Parallel select: Collect K cross-component non-CL candidates per
+         point (numba.prange).
+      2. Per-component merge: Group candidates by component, sort within
+         each component, process components lightest-first.  Each component
+         gets ONE merge attempt with K-fallback on CL blocks.
+      3. expand_cl: Record blocked pairs in bitset.
+      4. Compact CSR rows (prune same-component edges).
 
     CL enforcement:
       1. L1 via bitset in select_k_candidates_constrained
-      2. Preventive cross-component bitset walk in merge_k_candidates_constrained
+      2. Preventive cross-component bitset walk in merge_per_component
       3. CL expansion via expand_cl (set symmetric bits in bitset)
 
     Parameters
@@ -982,6 +1068,7 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
     n_components : int
     point_components : int32[:]
     edges : float64[:, 3] -- MST/MSF edges
+    n_rounds : int -- number of Borůvka rounds executed
     """
     distances = graph.weights
     indices = graph.indices
@@ -1004,35 +1091,29 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
 
     edges_list = [np.empty((0, 3), dtype=np.float64) for _ in range(0)]
 
-    # Per-point CSR-row pointer: reset to 0 at the start of each round
-    # (because update_graph_components compacts the rows).
-    cand_ptr = np.zeros(n_points, dtype=np.int32)
-
     max_rounds = n_points  # safety bound
 
-    # -- Main Borůvka loop (K-candidate, no inner retry) --
+    rounds_done = np.int32(0)
+
+    # -- Main Borůvka loop (per-component merge, K-fallback) --
     for _round in range(max_rounds):
         if n_components <= 1:
             break
 
-        # Reset pointers: update_graph_components compacts CSR rows at the
-        # end of each round, invalidating old offsets.
-        for i in range(n_points):
-            cand_ptr[i] = np.int32(0)
-
-        # Step 1: Collect K candidates per point (CSR rows are weight-sorted,
-        #         so the K candidates are already in ascending weight order)
-        (cand_weights, cand_dsts, cand_offsets,
+        # Step 1: Collect K candidates per point in parallel
+        #         (CSR rows are weight-sorted, so the K candidates are
+        #         already in ascending weight order per point)
+        (cand_weights, cand_dsts,
          cand_count) = select_k_candidates_constrained(
             distances, indices, indptr, point_components,
-            cl_bitset, cand_ptr, K)
+            cl_bitset, K)
 
-        # Step 2: Global mini-Kruskal merge over all N×K proposals
+        # Step 2: Per-component merge with K-fallback + both-sides guard
         (new_edges, blocked_u, blocked_v,
-         n_blocked) = merge_k_candidates_constrained(
+         n_blocked) = merge_per_component(
             disjoint_set,
-            cand_weights, cand_dsts, cand_offsets,
-            cand_count, cand_ptr,
+            cand_weights, cand_dsts, cand_count,
+            point_components,
             head, tail, next_node,
             cl_bitset)
 
@@ -1051,6 +1132,7 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
         update_point_components(disjoint_set, point_components)
         update_graph_components(distances, indices, indptr, point_components)
         n_components -= round_merged
+        rounds_done += np.int32(1)
 
     # Concatenate collected edges
     num_edges = 0
@@ -1064,7 +1146,7 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
             result[counter, 1] = el[e, 1]
             result[counter, 2] = el[e, 2]
             counter += 1
-    return n_components, point_components, result
+    return n_components, point_components, result, rounds_done
 
 
 # ===========================================================================
@@ -1161,7 +1243,7 @@ def constrained_hdbscan_from_boruvka(
         core_graph = CoreGraph(weights, distances, cg_indices, X_sym.indptr)
 
         # 4. Constrained graph-Boruvka MST (same DSU-check strategy as KD-tree)
-        n_components, component_labels, edges = minimum_spanning_tree_constrained(
+        n_components, component_labels, edges, n_rounds_mst = minimum_spanning_tree_constrained(
             core_graph, cl_indptr, cl_indices, K=merge_k)
 
         # 5. Bridge disconnected components with +inf edges
@@ -1173,7 +1255,7 @@ def constrained_hdbscan_from_boruvka(
             edges, X_sym.data, X_sym.indices, X_sym.indptr, core_dists_f64)
         edges = np.column_stack([edges[:, :2], mst_weights])
 
-        n_rounds = np.int64(0)
+        n_rounds = np.int64(n_rounds_mst)
         n_viols = np.int64(0)
 
     else:
@@ -1206,7 +1288,7 @@ def constrained_hdbscan_from_boruvka(
         core_graph = CoreGraph(weights, distances, cg_indices, X_sym.indptr)
 
         # Constrained graph-Boruvka MST
-        n_components, component_labels, edges = minimum_spanning_tree_constrained(
+        n_components, component_labels, edges, n_rounds_mst = minimum_spanning_tree_constrained(
             core_graph, cl_indptr, cl_indices, K=merge_k)
 
         # Bridge disconnected components with +inf edges
@@ -1218,7 +1300,7 @@ def constrained_hdbscan_from_boruvka(
             edges, X_sym.data, X_sym.indices, X_sym.indptr, core_dists_f64)
         edges = np.column_stack([edges[:, :2], mst_weights])
 
-        n_rounds = np.int64(0)
+        n_rounds = np.int64(n_rounds_mst)
         n_viols = np.int64(0)
 
     # -- Bridge MSF -> MST (KD-tree path; precomputed path bridges above) --
