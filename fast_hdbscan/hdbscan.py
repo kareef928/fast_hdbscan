@@ -160,6 +160,7 @@ def fast_hdbscan(
     cannot_link=None,
     validate_cannot_link=True,
     metric_kwds=None,
+    band_fraction=np.inf,
 ):
     if metric == "precomputed":
         if sample_weights is not None:
@@ -219,6 +220,7 @@ def fast_hdbscan(
         cannot_link=cannot_link,
         validate_cannot_link=validate_cannot_link,
         metric_kwds=metric_kwds,
+        band_fraction=band_fraction,
     )
 
     return (
@@ -251,6 +253,7 @@ def compute_minimum_spanning_tree(
     cannot_link=None,
     validate_cannot_link=True,
     metric_kwds=None,
+    band_fraction=np.inf,
 ):
     """
     Compute the minimum spanning tree for HDBSCAN.
@@ -280,8 +283,9 @@ def compute_minimum_spanning_tree(
           for pynndescent metrics, defaults to max(3 * min_samples, 15).
         - int  : approximate MST via KNN subgraph with this many neighbors.
     cannot_link : scipy sparse matrix or None
-        Symmetric sparse matrix of cannot-link constraints.  Only supported
-        with algorithm='kruskal'.
+        Symmetric sparse matrix of cannot-link constraints.  Supported with
+        algorithm='kruskal' (any metric) or algorithm='boruvka' with
+        metric='precomputed'.
     validate_cannot_link : bool
         If True (default), validate and symmetrize the cannot-link matrix
         (handles upper-triangle-only and lower-triangle-only inputs).
@@ -289,16 +293,23 @@ def compute_minimum_spanning_tree(
         a symmetric CSR matrix — avoids an O(nnz) symmetrization step.
     metric_kwds : dict or None
         Additional keyword arguments for the distance metric (pynndescent only).
+    band_fraction : float
+        Controls banding for CL-constrained Borůvka. Each round, only edges
+        within band_fraction of the minimum candidate weight are merged.
+        np.inf = no banding (standard Borůvka). 0.05 = 5% band (closer to
+        Kruskal ordering, better CL accuracy). Only used with
+        algorithm='boruvka' and cannot_link is not None.
     """
     if algorithm not in ("boruvka", "kruskal"):
         raise ValueError(
             "algorithm must be 'boruvka' or 'kruskal'. Got: %s" % algorithm
         )
 
-    if cannot_link is not None and algorithm != "kruskal":
+    if cannot_link is not None and algorithm != "kruskal" and metric != "precomputed":
         raise ValueError(
-            "cannot_link constraints are only supported with "
-            "algorithm='kruskal'. Got algorithm=%r." % algorithm
+            "cannot_link constraints with algorithm='boruvka' are only supported "
+            "with metric='precomputed'. For metric='euclidean', use "
+            "algorithm='kruskal'. Got algorithm=%r, metric=%r." % (algorithm, metric)
         )
 
     if metric == "precomputed":
@@ -316,6 +327,14 @@ def compute_minimum_spanning_tree(
                 validate_cannot_link=validate_cannot_link,
             )
         else:
+            if cannot_link is not None:
+                from .precomputed import compute_mst_from_precomputed_sparse_boruvka_cl
+
+                return compute_mst_from_precomputed_sparse_boruvka_cl(
+                    data, min_samples, cannot_link=cannot_link,
+                    validate_cannot_link=validate_cannot_link,
+                    band_fraction=band_fraction,
+                )
             from .precomputed import compute_mst_from_precomputed_sparse
 
             return compute_mst_from_precomputed_sparse(data, min_samples)
@@ -459,6 +478,7 @@ class HDBSCAN(ClusterMixin, BaseEstimator):
         cannot_link=None,
         validate_cannot_link=True,
         metric_kwds=None,
+        band_fraction=np.inf,
         # Removed **kwargs to comply with scikit-learn's API requirements
     ):
         self.min_cluster_size = min_cluster_size
@@ -477,6 +497,7 @@ class HDBSCAN(ClusterMixin, BaseEstimator):
         self.cannot_link = cannot_link
         self.validate_cannot_link = validate_cannot_link
         self.metric_kwds = metric_kwds
+        self.band_fraction = band_fraction
 
     def fit(self, X, y=None, sample_weight=None, **fit_params):
 
