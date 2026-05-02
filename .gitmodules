@@ -1,0 +1,6 @@
+[submodule "benchmarking"]
+	path = benchmarking
+	url = https://github.com/RichieHakim/mst_cl_graph_building.git
+[submodule "documents/boruvka_mst_manuscript"]
+	path = documents/boruvka_mst_manuscript
+	url = https://github.com/RichieHakim/mst_cl_benchmark_manuscript.git
