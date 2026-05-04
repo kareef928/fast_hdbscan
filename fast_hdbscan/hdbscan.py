@@ -276,8 +276,7 @@ def compute_minimum_spanning_tree(
         - int  : approximate MST via KNN subgraph with this many neighbors.
     cannot_link : scipy sparse matrix or None
         Symmetric sparse matrix of cannot-link constraints.  Supported with
-        algorithm='kruskal' (any metric) or algorithm='boruvka' with
-        metric='precomputed'.
+        algorithm='kruskal' (any metric) or algorithm='boruvka' (any metric).
     validate_cannot_link : bool
         If True (default), validate and symmetrize the cannot-link matrix
         (handles upper-triangle-only and lower-triangle-only inputs).
@@ -293,13 +292,6 @@ def compute_minimum_spanning_tree(
     if algorithm not in ("boruvka", "kruskal"):
         raise ValueError(
             "algorithm must be 'boruvka' or 'kruskal'. Got: %s" % algorithm
-        )
-
-    if cannot_link is not None and algorithm != "kruskal" and metric != "precomputed":
-        raise ValueError(
-            "cannot_link constraints with algorithm='boruvka' are only supported "
-            "with metric='precomputed'. For metric='euclidean', use "
-            "algorithm='kruskal'. Got algorithm=%r, metric=%r." % (algorithm, metric)
         )
 
     if metric == "precomputed":
@@ -343,6 +335,23 @@ def compute_minimum_spanning_tree(
             validate_cannot_link=validate_cannot_link,
         )
     else:
+        if cannot_link is not None:
+            from .kruskal import _validate_cannot_link
+            from .boruvka_cl import parallel_boruvka_cl
+
+            n_threads = numba.get_num_threads()
+            cl_indices, cl_indptr = _validate_cannot_link(
+                cannot_link, numba_tree.data.shape[0], validate=validate_cannot_link
+            )
+            return parallel_boruvka_cl(
+                numba_tree,
+                n_threads,
+                min_samples=min_samples,
+                cl_indices=cl_indices,
+                cl_indptr=cl_indptr,
+                sample_weights=sample_weights,
+                band_fraction=band_fraction,
+            )
         n_threads = numba.get_num_threads()
         edges, neighbors, core_distances = parallel_boruvka(
             numba_tree,

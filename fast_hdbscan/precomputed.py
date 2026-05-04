@@ -478,7 +478,7 @@ def compute_mst_from_precomputed_sparse(X, min_samples):
 
 def compute_mst_from_precomputed_sparse_boruvka_cl(
     X, min_samples, cannot_link=None, validate_cannot_link=True,
-    band_fraction=np.inf,
+    band_fraction=np.inf, cl_struct_mode=1,
 ):
     """
     Compute the MST from a sparse precomputed graph using CL-constrained
@@ -493,6 +493,13 @@ def compute_mst_from_precomputed_sparse_boruvka_cl(
     min_samples : int
     cannot_link : scipy sparse matrix or None
     validate_cannot_link : bool
+    band_fraction : float
+        Forwarded to ``boruvka_mst_cl``.  ``np.inf`` (default) = no banding.
+    cl_struct_mode : int (default 1)
+        Forwarded to ``boruvka_mst_cl``.  Selects the CL conflict-tracking
+        data structure: 0 = legacy linked-list pool, 1 = sorted-array
+        (~2.6× faster at n=50k; default).  Exposed for benchmarking; not
+        propagated to the public ``fast_hdbscan`` / ``HDBSCAN`` API.
 
     Returns
     -------
@@ -529,7 +536,8 @@ def compute_mst_from_precomputed_sparse_boruvka_cl(
     # 5. CL-constrained Borůvka MST
     if cl_indices is not None and len(cl_indices) > 0:
         n_components, component_labels, mst_edges = boruvka_mst_cl(
-            core_graph, cl_indices, cl_indptr, band_fraction=band_fraction
+            core_graph, cl_indices, cl_indptr,
+            band_fraction=band_fraction, cl_struct_mode=cl_struct_mode,
         )
     else:
         n_components, component_labels, mst_edges = boruvka_mst(core_graph)

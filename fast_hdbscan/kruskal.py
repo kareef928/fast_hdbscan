@@ -2,10 +2,12 @@
 Kruskal's MST algorithm for fast_hdbscan.
 
 Entry points:
-  - kruskal_mst_from_feature_matrix : feature data (euclidean metric)
+  - kruskal_mst_from_feature_matrix     : feature data (euclidean metric)
       knn_k=None  -> exact MST via full pairwise distances  (O(n^2) memory)
       knn_k=<int> -> approximate MST via KNN subgraph       (O(n*k) memory)
-  - kruskal_mst_from_csr            : precomputed sparse distance matrix
+  - kruskal_mst_from_csr               : precomputed sparse distance matrix
+  - boruvka_mst_cl_from_feature_matrix : CL-constrained Borůvka on euclidean data,
+      routed through the precomputed Borůvka-CL kernel via an internal CSR
 
 Rich Hakim 2026_03_05.  JIT and algorithm design with Claude Code.
 """

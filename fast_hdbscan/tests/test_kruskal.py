@@ -785,13 +785,34 @@ class TestCannotLinkEntryPoints:
             assert labels[0] != labels[7], \
                 "CL-constrained points should not share a cluster"
 
-    def test_boruvka_with_cl_raises(self):
-        """algorithm='boruvka' + cannot_link raises ValueError."""
-        cl = _make_cl_matrix(10, [(0, 5)])
-        with pytest.raises(ValueError, match="cannot_link"):
-            compute_minimum_spanning_tree(
-                np.random.randn(10, 2), algorithm="boruvka", cannot_link=cl,
-            )
+    def test_boruvka_euclidean_with_cl_succeeds(self):
+        """algorithm='boruvka' + metric='euclidean' + cannot_link now succeeds."""
+        rng = np.random.RandomState(42)
+        X = rng.randn(20, 2)
+        cl = _make_cl_matrix(20, [(0, 10)])
+        edges, neighbors, core_dists = compute_minimum_spanning_tree(
+            X, min_samples=3, algorithm="boruvka", cannot_link=cl,
+        )
+        assert edges.shape == (19, 3), "MST must have n-1 edges"
+        # Zero CL violations on finite-weight edges
+        cl_csr = sparse.csr_matrix(cl)
+        parent = np.arange(20, dtype=np.int32)
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in edges[np.isfinite(edges[:, 2])]:
+            u, v = int(e[0]), int(e[1])
+            ru, rv = _find(u), _find(v)
+            if ru != rv:
+                parent[rv] = ru
+        cl_coo = cl_csr.tocoo()
+        violations = [(i, j) for i, j in zip(cl_coo.row, cl_coo.col)
+                      if j > i and _find(i) == _find(j)]
+        assert len(violations) == 0, f"CL violations: {violations}"
 
     def test_cl_none_matches_unconstrained(self):
         """cannot_link=None gives identical results to no CL."""
@@ -1665,16 +1686,36 @@ class TestBoruvkaCL:
                 "CL pair (0, 1) ended up in the same cluster"
             )
 
-    def test_euclidean_boruvka_cl_raises(self):
-        """algorithm='boruvka' + metric='euclidean' + cannot_link -> error."""
-        X = np.random.rand(10, 3)
-        cl = sparse.eye(10, format="csr")
+    def test_euclidean_boruvka_cl_succeeds(self):
+        """algorithm='boruvka' + metric='euclidean' + cannot_link now succeeds."""
+        rng = np.random.RandomState(99)
+        n = 20
+        X = rng.rand(n, 3)
+        cl = sparse.lil_matrix((n, n))
+        cl[0, 5] = 1
+        cl[5, 0] = 1
+        cl = cl.tocsr()
 
-        with pytest.raises(ValueError, match="cannot_link"):
-            compute_minimum_spanning_tree(
-                X, min_samples=2, metric="euclidean", algorithm="boruvka",
-                cannot_link=cl,
-            )
+        edges, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=2, metric="euclidean", algorithm="boruvka",
+            cannot_link=cl,
+        )
+        assert edges.shape == (n - 1, 3), "MST must have n-1 edges"
+        # Verify CL pair (0, 5) not co-clustered via finite edges
+        parent = np.arange(n, dtype=np.int32)
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in edges[np.isfinite(edges[:, 2])]:
+            u, v = int(e[0]), int(e[1])
+            ru, rv = _find(u), _find(v)
+            if ru != rv:
+                parent[rv] = ru
+        assert _find(0) != _find(5), "CL pair (0, 5) must not be co-clustered"
 
     # --- Banding-specific tests ---
 
@@ -1813,3 +1854,361 @@ class TestBoruvkaCL:
             assert labels[0] != labels[1], (
                 "CL pair (0, 1) ended up in the same cluster"
             )
+
+
+# ---------------------------------------------------------------------------
+# BFS-dedup pilot: dedup_mode + bfs_tie_fix toggles
+# ---------------------------------------------------------------------------
+
+class TestBoruvkaCLDedupPilot:
+    """
+    Sanity tests for the experimental ``dedup_mode`` and ``bfs_tie_fix`` knobs
+    on ``boruvka_mst_cl`` / ``boruvka_mst_cl_pyloop``.
+
+    The defaults ``(dedup_mode=0, bfs_tie_fix=0)`` must remain bit-identical
+    to current production behavior.  Option D ``(1, 0)`` must be bit-identical
+    to baseline.  Option A ``(2, 1)`` must be bit-identical to the tie-fix-only
+    reference ``(0, 1)``.
+    """
+
+    @staticmethod
+    def _canonicalize_edges(edges):
+        e = edges.copy()
+        swap = e[:, 0] > e[:, 1]
+        e[swap, 0], e[swap, 1] = edges[swap, 1], edges[swap, 0]
+        order = np.lexsort((e[:, 2], e[:, 1], e[:, 0]))
+        return e[order]
+
+    @staticmethod
+    def _build_inputs(seed, n=400, n_blocks=4, density=0.02):
+        """Synthetic block-kNN graph + within-block CL pairs.  Small n by design."""
+        from fast_hdbscan.precomputed import (
+            _symmetrize_min_csr, _core_distances_csr, _build_core_graph_csr,
+        )
+        from fast_hdbscan.kruskal import _validate_cannot_link
+
+        rng = np.random.RandomState(seed)
+        block_size = n // n_blocks
+        rows, cols, data = [], [], []
+        for blk in range(n_blocks):
+            lo = blk * block_size
+            hi = (blk + 1) * block_size
+            ## intra-block: dense
+            for i in range(lo, hi):
+                for j in range(i + 1, min(i + 5, hi)):
+                    w = rng.uniform(0.5, 1.5)
+                    rows.extend([i, j]); cols.extend([j, i]); data.extend([w, w])
+            ## inter-block: sparse links so the graph is connected
+            if blk + 1 < n_blocks:
+                src = lo + rng.randint(0, hi - lo)
+                dst = hi + rng.randint(0, block_size)
+                w = rng.uniform(2.0, 3.0)
+                rows.extend([src, dst]); cols.extend([dst, src]); data.extend([w, w])
+        X = sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
+        X = X.maximum(X.T)
+        X.setdiag(0)
+        X.eliminate_zeros()
+
+        ## within-block CL: random pairs inside each block
+        n_cl_per_block = max(1, int(density * block_size * block_size))
+        cl_rows, cl_cols = [], []
+        for blk in range(n_blocks):
+            lo = blk * block_size
+            for _ in range(n_cl_per_block):
+                i = lo + rng.randint(0, block_size)
+                j = lo + rng.randint(0, block_size)
+                if i == j:
+                    continue
+                cl_rows.extend([i, j]); cl_cols.extend([j, i])
+        cl = sparse.csr_matrix(
+            (np.ones(len(cl_rows), dtype=np.int32), (cl_rows, cl_cols)),
+            shape=(n, n),
+        )
+
+        X_sym = _symmetrize_min_csr(X)
+        _, core_distances = _core_distances_csr(
+            X_sym.data, X_sym.indices, X_sym.indptr, 5
+        )
+        cl_indices, cl_indptr = _validate_cannot_link(cl, n, validate=True)
+        weights, distances, cg_indices = _build_core_graph_csr(
+            X_sym.data, X_sym.indices, X_sym.indptr, core_distances
+        )
+        return weights, distances, cg_indices, X_sym.indptr, cl_indices, cl_indptr, n
+
+    def _run(self, inputs, dedup_mode, bfs_tie_fix):
+        """Run boruvka_mst_cl on a fresh CoreGraph copy."""
+        from fast_hdbscan.core_graph import CoreGraph, boruvka_mst_cl
+        weights, distances, cg_idx, indptr, cl_idx, cl_ip, _ = inputs
+        cg = CoreGraph(weights.copy(), distances.copy(), cg_idx.copy(), indptr)
+        _, _, edges = boruvka_mst_cl(
+            cg, cl_idx, cl_ip,
+            band_fraction=np.inf,
+            overwrite=False,
+            dedup_mode=dedup_mode,
+            bfs_tie_fix=bfs_tie_fix,
+        )
+        return self._canonicalize_edges(edges)
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_optionD_bit_identical_to_baseline(self, seed):
+        """Ordered-pair dedup (1, 0) must match baseline (0, 0) bit-identically."""
+        inp = self._build_inputs(seed=seed)
+        e_baseline = self._run(inp, dedup_mode=0, bfs_tie_fix=0)
+        e_optD = self._run(inp, dedup_mode=1, bfs_tie_fix=0)
+        assert e_baseline.shape == e_optD.shape
+        assert np.array_equal(e_baseline[:, :2], e_optD[:, :2])
+        assert np.array_equal(
+            ~np.isfinite(e_baseline[:, 2]), ~np.isfinite(e_optD[:, 2])
+        )
+        finite = np.isfinite(e_baseline[:, 2]) & np.isfinite(e_optD[:, 2])
+        if finite.any():
+            assert float(np.max(np.abs(
+                e_baseline[finite, 2] - e_optD[finite, 2]
+            ))) == 0.0
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_optionA_bit_identical_to_tiefix(self, seed):
+        """Canonical dedup + tie-fix (2, 1) must match (0, 1) bit-identically."""
+        inp = self._build_inputs(seed=seed)
+        e_tiefix = self._run(inp, dedup_mode=0, bfs_tie_fix=1)
+        e_optA = self._run(inp, dedup_mode=2, bfs_tie_fix=1)
+        assert e_tiefix.shape == e_optA.shape
+        assert np.array_equal(e_tiefix[:, :2], e_optA[:, :2])
+        assert np.array_equal(
+            ~np.isfinite(e_tiefix[:, 2]), ~np.isfinite(e_optA[:, 2])
+        )
+        finite = np.isfinite(e_tiefix[:, 2]) & np.isfinite(e_optA[:, 2])
+        if finite.any():
+            assert float(np.max(np.abs(
+                e_tiefix[finite, 2] - e_optA[finite, 2]
+            ))) == 0.0
+
+    def test_pyloop_counters_have_expected_keys(self):
+        """boruvka_mst_cl_pyloop must export the new counters (5, 6) per round."""
+        from fast_hdbscan.core_graph import CoreGraph, boruvka_mst_cl_pyloop
+        inp = self._build_inputs(seed=0)
+        weights, distances, cg_idx, indptr, cl_idx, cl_ip, _ = inp
+        cg = CoreGraph(weights.copy(), distances.copy(), cg_idx.copy(), indptr)
+        _, _, _, timing = boruvka_mst_cl_pyloop(
+            cg, cl_idx, cl_ip,
+            band_fraction=np.inf,
+            collect_timings=True,
+            dedup_mode=2,
+            bfs_tie_fix=1,
+        )
+        assert "rounds_n_cl_pairs_pre_filter" in timing
+        assert "rounds_n_unique_violation_pairs" in timing
+        assert "total_n_cl_pairs_pre_filter" in timing
+        assert "total_n_unique_violation_pairs" in timing
+        ## Echo of the toggles
+        assert timing["dedup_mode"] == 2
+        assert timing["bfs_tie_fix"] == 1
+        ## With dedup_mode==2 active, unique pairs <= raw post-filter scan
+        ## (counters[6] <= counters[1]).
+        assert (
+            timing["total_n_unique_violation_pairs"]
+            <= timing["total_n_cl_pairs_scanned"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Euclidean Borůvka-CL tests
+# ---------------------------------------------------------------------------
+
+class TestEuclideanBoruvkaCL:
+    """
+    Tests for the fast-path Euclidean+CL+Borůvka routing through
+    compute_minimum_spanning_tree / fast_hdbscan / HDBSCAN.
+
+    The routing now uses parallel_boruvka_cl (dual-tree fast path) instead
+    of the former boruvka_mst_cl_from_feature_matrix (CSR-based slow path).
+    """
+
+    @staticmethod
+    def _make_blobs_cl(n=120, n_blocks=3, seed=0, density=0.05):
+        """
+        Generate well-separated blobs and within-block CL pairs.
+
+        Returns (X float64, cl sparse CSR).
+        """
+        from sklearn.datasets import make_blobs
+        rng = np.random.RandomState(seed)
+        X, block_labels = make_blobs(
+            n_samples=n,
+            centers=n_blocks,
+            cluster_std=0.3,
+            random_state=seed,
+        )
+        X = X.astype(np.float64)
+
+        # Within-block CL pairs at given density
+        cl = sparse.lil_matrix((n, n))
+        for blk in range(n_blocks):
+            idx = np.where(block_labels == blk)[0]
+            m = len(idx)
+            i_loc, j_loc = np.triu_indices(m, k=1)
+            keep = rng.rand(len(i_loc)) < density
+            for ii, jj in zip(idx[i_loc[keep]], idx[j_loc[keep]]):
+                cl[ii, jj] = 1
+                cl[jj, ii] = 1
+        return X, cl.tocsr()
+
+    @staticmethod
+    def _check_cl_violations(edges, cl_csr, n):
+        """Return list of (i, j) CL pairs co-clustered via finite MST edges."""
+        parent = np.arange(n, dtype=np.int32)
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in edges[np.isfinite(edges[:, 2])]:
+            u, v = int(e[0]), int(e[1])
+            ru, rv = _find(u), _find(v)
+            if ru != rv:
+                parent[rv] = ru
+        cl_coo = cl_csr.tocoo()
+        return [(i, j) for i, j in zip(cl_coo.row, cl_coo.col)
+                if j > i and _find(i) == _find(j)]
+
+    def test_zero_cl_violations_via_public_api(self):
+        """
+        compute_minimum_spanning_tree(algorithm='boruvka', cannot_link=cl)
+        produces zero CL violations on the new dual-tree fast path.
+        """
+        from fast_hdbscan.hdbscan import compute_minimum_spanning_tree
+
+        X, cl = self._make_blobs_cl(n=150, seed=1)
+        n = X.shape[0]
+        edges, neighbors, core_dists = compute_minimum_spanning_tree(
+            X, min_samples=5, algorithm="boruvka", cannot_link=cl,
+        )
+        assert edges.shape == (n - 1, 3)
+        viol = self._check_cl_violations(edges, cl, n)
+        assert len(viol) == 0, f"CL violations: {viol}"
+        assert neighbors.shape[0] == n
+        assert core_dists.shape == (n,)
+
+    @pytest.mark.parametrize("band_fraction", [0.5, 0.1, 0.02])
+    def test_band_fraction_has_effect(self, band_fraction):
+        """
+        band_fraction is actually consumed on the Euclidean+Borůvka-CL path:
+        banded MST differs from the unbanded (band_fraction=np.inf) MST, AND
+        both produce zero CL violations.
+        """
+        from fast_hdbscan.hdbscan import compute_minimum_spanning_tree
+
+        # n=200, density=0.15: enough CL constraints that banding kicks in
+        X, cl = self._make_blobs_cl(n=200, seed=3, density=0.15)
+        n = X.shape[0]
+
+        edges_inf, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=5, algorithm="boruvka", cannot_link=cl,
+            band_fraction=np.inf,
+        )
+        edges_banded, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=5, algorithm="boruvka", cannot_link=cl,
+            band_fraction=band_fraction,
+        )
+
+        # Both must be CL-clean
+        viol_inf = self._check_cl_violations(edges_inf, cl, n)
+        viol_banded = self._check_cl_violations(edges_banded, cl, n)
+        assert len(viol_inf) == 0, f"band_fraction=inf: violations {viol_inf}"
+        assert len(viol_banded) == 0, (
+            f"band_fraction={band_fraction}: violations {viol_banded}"
+        )
+
+        # Banded MST must differ from unbanded (banding changes edge selection)
+        w_inf = float(np.sum(edges_inf[np.isfinite(edges_inf[:, 2]), 2]))
+        w_banded = float(np.sum(edges_banded[np.isfinite(edges_banded[:, 2]), 2]))
+        assert abs(w_inf - w_banded) > 1e-8, (
+            f"band_fraction={band_fraction} produced identical total weight "
+            f"({w_banded:.6f}) as band_fraction=inf — banding had no effect"
+        )
+
+    def test_band_fraction_inf_zero_violations(self):
+        """
+        band_fraction=np.inf (no banding) is the default and produces zero CL violations.
+        Regression guard: inf path must still work correctly after refactor.
+        """
+        from fast_hdbscan.hdbscan import compute_minimum_spanning_tree
+
+        X, cl = self._make_blobs_cl(n=150, seed=7, density=0.10)
+        n = X.shape[0]
+        edges, _, _ = compute_minimum_spanning_tree(
+            X, min_samples=5, algorithm="boruvka", cannot_link=cl,
+            band_fraction=np.inf,
+        )
+        assert edges.shape == (n - 1, 3)
+        viol = self._check_cl_violations(edges, cl, n)
+        assert len(viol) == 0, f"band_fraction=inf regression: violations {viol}"
+
+    def test_end_to_end_fast_hdbscan(self):
+        """fast_hdbscan(algorithm='boruvka', metric='euclidean', cannot_link=cl) works."""
+        X, cl = self._make_blobs_cl(n=120, seed=4)
+        n = X.shape[0]
+
+        labels, probs = fast_hdbscan(
+            X,
+            min_cluster_size=5,
+            min_samples=5,
+            algorithm="boruvka",
+            metric="euclidean",
+            cannot_link=cl,
+        )
+        assert labels.shape == (n,)
+        assert probs.shape == (n,)
+
+        # Verify no CL pair shares a non-noise cluster
+        cl_coo = cl.tocoo()
+        for i, j in zip(cl_coo.row, cl_coo.col):
+            if j <= i:
+                continue
+            if labels[i] >= 0 and labels[j] >= 0:
+                assert labels[i] != labels[j], (
+                    f"CL pair ({i}, {j}) share cluster {labels[i]}"
+                )
+
+    def test_sample_weights_works(self):
+        """sample_weights + boruvka + euclidean + cannot_link works (new path supports it)."""
+        from fast_hdbscan.hdbscan import compute_minimum_spanning_tree
+
+        X, cl = self._make_blobs_cl(n=60, seed=5)
+        n = X.shape[0]
+        sw = np.ones(n, dtype=np.float32)
+
+        edges, neighbors, core_dists = compute_minimum_spanning_tree(
+            X, min_samples=3, algorithm="boruvka", cannot_link=cl,
+            sample_weights=sw,
+        )
+        assert edges.shape == (n - 1, 3)
+        viol = self._check_cl_violations(edges, cl, n)
+        assert len(viol) == 0, f"sample_weights path: {viol} violations"
+
+    def test_hdbscan_class_euclidean_boruvka_cl(self):
+        """HDBSCAN(algorithm='boruvka', metric='euclidean', cannot_link=cl).fit(X)."""
+        X, cl = self._make_blobs_cl(n=120, seed=6)
+        n = X.shape[0]
+
+        model = HDBSCAN(
+            min_cluster_size=5,
+            min_samples=5,
+            metric="euclidean",
+            algorithm="boruvka",
+            cannot_link=cl,
+        )
+        labels = model.fit_predict(X)
+        assert labels.shape == (n,)
+
+        # Verify no CL pair shares a non-noise cluster
+        cl_coo = cl.tocoo()
+        for i, j in zip(cl_coo.row, cl_coo.col):
+            if j <= i:
+                continue
+            if labels[i] >= 0 and labels[j] >= 0:
+                assert labels[i] != labels[j], (
+                    f"CL pair ({i}, {j}) share cluster {labels[i]}"
+                )

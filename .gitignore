@@ -135,3 +135,17 @@ dmypy.json
 .idea/vcs.xml
 .idea/inspectionProfiles/profiles_settings.xml
 .idea/inspectionProfiles/Project_Default.xml
+
+# Other
+.claude/
+agent_assets/
+
+# Benchmark outputs are artifacts, not auditable repo code.
+benchmarking/**/*.csv
+benchmarking/**/*.json
+benchmarking/**/*.jsonl
+benchmarking/**/*.log
+benchmarking/**/*.png
+benchmarking/**/*.pdf
+benchmarking/**/*.svg
+benchmarking/**/runs*/
