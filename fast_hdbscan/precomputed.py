@@ -528,7 +528,7 @@ def compute_mst_from_precomputed_sparse_boruvka_cl(
 
     # 5. CL-constrained Borůvka MST
     if cl_indices is not None and len(cl_indices) > 0:
-        n_components, component_labels, mst_edges = boruvka_mst_cl(
+        n_components, component_labels, mst_edges, _n_rounds = boruvka_mst_cl(
             core_graph, cl_indices, cl_indptr, band_fraction=band_fraction
         )
     else:

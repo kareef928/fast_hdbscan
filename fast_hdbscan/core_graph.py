@@ -726,6 +726,7 @@ def boruvka_mst_cl(graph, cl_indices, cl_indptr, band_fraction=np.inf,
     n_components : int
     point_components : int32[:] shape (n,)
     mst_edges : float64[:, 3]
+    n_rounds : int
     """
     distances = graph.weights
     indices = graph.indices
@@ -746,6 +747,7 @@ def boruvka_mst_cl(graph, cl_indices, cl_indptr, band_fraction=np.inf,
 
     edges_list = [np.empty((0, 3), dtype=np.float64) for _ in range(0)]
     use_banding = band_fraction < 1e30  # avoid inf comparisons
+    n_rounds = np.int32(0)
 
     # Pre-allocate scratch arrays for validate_and_prune_merges (reused each round)
     max_adj = 2 * n  # upper bound: at most n/2 candidates per round
@@ -843,6 +845,7 @@ def boruvka_mst_cl(graph, cl_indices, cl_indptr, band_fraction=np.inf,
         update_point_components(disjoint_set, point_components)
         update_graph_components(distances, indices, indptr, point_components)
         n_components -= n_added
+        n_rounds += np.int32(1)
 
     counter = 0
     num_edges = sum([edges.shape[0] for edges in edges_list])
@@ -850,7 +853,7 @@ def boruvka_mst_cl(graph, cl_indices, cl_indptr, band_fraction=np.inf,
     for edges in edges_list:
         result[counter : counter + edges.shape[0]] = edges
         counter += edges.shape[0]
-    return n_components, point_components, result
+    return n_components, point_components, result, n_rounds
 
 
 def core_graph_to_rec_array(graph):

@@ -847,8 +847,9 @@ def merge_per_component(disjoint_set,
                         cand_weights, cand_dsts, cand_count,
                         point_components,
                         head, tail, next_node,
-                        cl_bitset):
-    """Per-component merge with K-fallback and both-sides guard.
+                        cl_bitset,
+                        guard_mode=np.int32(1)):
+    """Per-component merge with K-fallback and configurable guard.
 
     Phase A: Build component→members mapping from *point_components*.
     Phase B: For each component, gather its members' candidates and sort
@@ -856,8 +857,10 @@ def merge_per_component(disjoint_set,
     Phase C: Sort components by lightest candidate weight (O(C log C)).
     Phase D: Process components lightest-first.  For each component, scan
              its sorted candidate list:
-               - Skip if source or target already merged this round
-                 (both-sides *comp_merged* guard).
+               - guard_mode 0: no comp_merged guard (greedy, more merges)
+               - guard_mode 1: source-only guard (skip if source already merged)
+               - guard_mode 2: source+target guard (skip if source OR target
+                 already merged this round)
                - CL check via *check_merge_violates*.
                - On block: record blocked pair, K-fallback to next candidate.
                - On valid: accept edge, union, mark *comp_merged*, BREAK.
@@ -986,10 +989,10 @@ def merge_per_component(disjoint_set,
         if pc_count[ci] == 0:
             continue
 
-        # Check if this component was already absorbed as a target
+        # Source-side guard (modes 1 and 2): skip if already merged
         comp_id = unique_comps[ci]
         root_c = ds_find(disjoint_set, comp_id)
-        if comp_merged[root_c]:
+        if guard_mode >= np.int32(1) and comp_merged[root_c]:
             continue
 
         # Scan this component's sorted candidate list (K-fallback)
@@ -1007,8 +1010,8 @@ def merge_per_component(disjoint_set,
             if root_src == root_dst:
                 continue
 
-            # Both-sides guard: target already merged this round
-            if comp_merged[root_dst]:
+            # Target-side guard (mode 2 only): skip if target already merged
+            if guard_mode >= np.int32(2) and comp_merged[root_dst]:
                 continue
 
             # Preventive CL check (bitset cross-walk)
@@ -1029,7 +1032,8 @@ def merge_per_component(disjoint_set,
             loser = root_dst if new_root == root_src else root_src
             linked_list_merge(head, tail, next_node, new_root, loser)
             comp_merged[new_root] = True
-            break  # early stop: this component is done for the round
+            if guard_mode >= np.int32(1):
+                break  # early stop: this component is done for the round
 
     return (result[:result_idx],
             blocked_u[:blocked_idx], blocked_v[:blocked_idx], blocked_idx)
@@ -1037,11 +1041,12 @@ def merge_per_component(disjoint_set,
 
 @numba.njit(cache=NUMBA_CACHE)
 def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
-                                      overwrite=False, K=8):
+                                      overwrite=False, K=8,
+                                      guard_mode=np.int32(1)):
     """Constrained graph-Borůvka MST on a CoreGraph (precomputed path).
 
     Uses K-candidate per-point selection with per-component merge,
-    K-fallback, and both-sides comp_merged guard.  Each round:
+    K-fallback, and configurable comp_merged guard.  Each round:
       1. Parallel select: Collect K cross-component non-CL candidates per
          point (numba.prange).
       2. Per-component merge: Group candidates by component, sort within
@@ -1108,14 +1113,15 @@ def minimum_spanning_tree_constrained(graph, cl_indptr, cl_indices,
             distances, indices, indptr, point_components,
             cl_bitset, K)
 
-        # Step 2: Per-component merge with K-fallback + both-sides guard
+        # Step 2: Per-component merge with K-fallback + guard_mode
         (new_edges, blocked_u, blocked_v,
          n_blocked) = merge_per_component(
             disjoint_set,
             cand_weights, cand_dsts, cand_count,
             point_components,
             head, tail, next_node,
-            cl_bitset)
+            cl_bitset,
+            guard_mode)
 
         round_merged = np.int32(new_edges.shape[0])
         if round_merged > 0:
