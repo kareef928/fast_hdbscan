@@ -15,7 +15,7 @@ from .boruvka import (
     update_component_vectors,
     sample_weight_core_distance,
 )
-from .core_graph import validate_and_prune_merges
+from .core_graph_cl import validate_and_prune_merges
 from .disjoint_set import ds_rank_create, ds_find, ds_union_by_rank
 from .numba_kdtree import parallel_tree_query, rdist, point_to_node_lower_bound_rdist
 from .variables import NUMBA_CACHE

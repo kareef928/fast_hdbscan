@@ -23,7 +23,8 @@ import numpy as np
 import scipy.sparse
 import numba
 
-from .core_graph import CoreGraph, boruvka_mst, boruvka_mst_cl
+from .core_graph import CoreGraph, boruvka_mst
+from .core_graph_cl import boruvka_mst_cl
 from .variables import NUMBA_CACHE
 
 
