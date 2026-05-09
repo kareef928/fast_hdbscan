@@ -817,6 +817,42 @@ class TestCannotLinkEntryPoints:
         if labels[0] != -1 and labels[1] != -1:
             assert labels[0] != labels[1]
 
+    def test_boruvka_native_euclidean_cl_enforced_in_labels(self):
+        """Native Euclidean Boruvka keeps CL-constrained points separated."""
+        rng = np.random.RandomState(41)
+        X_a = rng.randn(12, 2) * 0.2 + np.array([-4, 0])
+        X_b = rng.randn(12, 2) * 0.2 + np.array([4, 0])
+        X = np.vstack([X_a, X_b])
+        cl_pairs = [(0, 7)]
+        cl = _make_cl_matrix(X.shape[0], cl_pairs)
+
+        labels, _ = fast_hdbscan(
+            X,
+            min_cluster_size=3,
+            min_samples=2,
+            algorithm="boruvka",
+            cannot_link=cl,
+        )
+        assert _check_cl_violations(labels, cl_pairs) == []
+
+    def test_boruvka_native_euclidean_sample_weighted_cl_mst_smoke(self):
+        """Sample-weighted native Euclidean Boruvka accepts CL constraints."""
+        rng = np.random.RandomState(42)
+        X = rng.randn(12, 2)
+        sample_weights = np.linspace(0.5, 1.5, X.shape[0]).astype(np.float32)
+        cl = _make_cl_matrix(X.shape[0], [(0, 5)])
+
+        mst, neighbors, core_dists = compute_minimum_spanning_tree(
+            X,
+            min_samples=3,
+            sample_weights=sample_weights,
+            algorithm="boruvka",
+            cannot_link=cl,
+        )
+        assert mst.shape == (X.shape[0] - 1, 3)
+        assert neighbors.shape[0] == X.shape[0]
+        assert core_dists.shape == (X.shape[0],)
+
     def test_boruvka_pynndescent_route_rejects_cl(self):
         """pynndescent-backed routes still reject cannot_link constraints."""
         n = 12
@@ -1684,6 +1720,46 @@ class TestCannotLinkGroupsEntryPoints:
         assert mst.shape == (n - 1, 3)
         assert neighbors.shape[0] == n
         assert core_dists.shape == (n,)
+
+    def test_boruvka_native_euclidean_groups_enforced_in_labels(self):
+        """Native Euclidean Boruvka keeps same-group samples separated."""
+        rng = np.random.RandomState(43)
+        X_a = rng.randn(12, 2) * 0.2 + np.array([-4, 0])
+        X_b = rng.randn(12, 2) * 0.2 + np.array([4, 0])
+        X = np.vstack([X_a, X_b])
+        group_labels = np.full(X.shape[0], -1, dtype=np.int32)
+        group_labels[[0, 3, 7]] = 0
+        cl_pairs = _groups_to_cl_pairs(group_labels)
+
+        labels, _ = fast_hdbscan(
+            X,
+            min_cluster_size=3,
+            min_samples=2,
+            algorithm="boruvka",
+            cannot_link_groups=group_labels,
+        )
+        assert _check_cl_violations(labels, cl_pairs) == []
+
+    def test_boruvka_precomputed_groups_enforced_in_labels(self):
+        """Sparse precomputed Boruvka enforces cannot_link_groups."""
+        rng = np.random.RandomState(44)
+        X_a = rng.randn(12, 2) * 0.2 + np.array([-4, 0])
+        X_b = rng.randn(12, 2) * 0.2 + np.array([4, 0])
+        X = np.vstack([X_a, X_b])
+        G = _full_pairwise_sparse(X)
+        group_labels = np.full(X.shape[0], -1, dtype=np.int32)
+        group_labels[[0, 3, 7]] = 0
+        cl_pairs = _groups_to_cl_pairs(group_labels)
+
+        labels, _ = fast_hdbscan(
+            G,
+            min_cluster_size=3,
+            min_samples=2,
+            metric="precomputed",
+            algorithm="boruvka",
+            cannot_link_groups=group_labels,
+        )
+        assert _check_cl_violations(labels, cl_pairs) == []
 
     def test_cl_enforced_in_labels(self):
         """Same-group samples end up in different clusters or noise."""
