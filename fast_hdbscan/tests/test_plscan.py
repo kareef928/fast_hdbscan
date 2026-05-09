@@ -599,13 +599,22 @@ def test_plscan_cannot_link():
     assert len(model.labels_) == X.shape[0]
 
 
-def test_plscan_cannot_link_requires_kruskal():
-    """cannot_link with algorithm='boruvka' should raise ValueError."""
+def test_plscan_cannot_link_boruvka_euclidean():
+    """PLSCAN supports cannot-link constraints via Boruvka on euclidean data."""
     import scipy.sparse
 
-    cannot_link = scipy.sparse.csr_matrix((X.shape[0], X.shape[0]))
-    with pytest.raises(ValueError, match="cannot_link"):
-        PLSCAN(algorithm="boruvka", cannot_link=cannot_link)
+    cannot_link = scipy.sparse.csr_matrix(
+        ([True, True], ([0, 1], [1, 0])), shape=(X.shape[0], X.shape[0])
+    )
+    model = PLSCAN(
+        algorithm="boruvka",
+        cannot_link=cannot_link,
+        base_min_cluster_size=5,
+    ).fit(X)
+    assert hasattr(model, "labels_")
+    assert len(model.labels_) == X.shape[0]
+    assert hasattr(model, "cluster_layers_")
+    assert len(model.cluster_layers_) >= 1
 
 
 def test_plscan_invalid_algorithm():

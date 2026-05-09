@@ -618,6 +618,99 @@ def _validate_cannot_link_groups(cannot_link_groups, n):
     return group_labels, n_groups
 
 
+def _cannot_link_groups_to_sparse(cannot_link_groups, n):
+    """
+    Materialize group-label cannot-link constraints as a pairwise sparse matrix.
+
+    Samples sharing the same non-negative group label are expanded into all
+    pairwise cannot-link edges within that group.  This is intended for
+    Borůvka CL implementations, which accept pairwise CSR constraints only.
+
+    Parameters
+    ----------
+    cannot_link_groups : array-like, shape (n,)
+        Integer group labels.  -1 means unconstrained.
+    n : int
+        Expected length (number of samples).
+
+    Returns
+    -------
+    cannot_link : scipy.sparse.csr_matrix, shape (n, n)
+        Symmetric pairwise cannot-link matrix.
+    """
+    import scipy.sparse
+
+    group_labels, n_groups = _validate_cannot_link_groups(cannot_link_groups, n)
+    if n_groups == 0:
+        return scipy.sparse.csr_matrix((n, n), dtype=np.bool_)
+
+    row_blocks = []
+    col_blocks = []
+    for group_id in range(n_groups):
+        group_members = np.flatnonzero(group_labels == group_id).astype(np.int32)
+        if group_members.shape[0] < 2:
+            continue
+
+        row_idx, col_idx = np.triu_indices(group_members.shape[0], k=1)
+        upper_rows = group_members[row_idx]
+        upper_cols = group_members[col_idx]
+        row_blocks.extend((upper_rows, upper_cols))
+        col_blocks.extend((upper_cols, upper_rows))
+
+    if len(row_blocks) == 0:
+        return scipy.sparse.csr_matrix((n, n), dtype=np.bool_)
+
+    rows = np.concatenate(row_blocks).astype(np.int32)
+    cols = np.concatenate(col_blocks).astype(np.int32)
+    data = np.ones(rows.shape[0], dtype=np.bool_)
+    return scipy.sparse.coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
+
+
+def _resolve_pairwise_cl_params(n, cannot_link=None, validate_cannot_link=True,
+                                cannot_link_groups=None):
+    """
+    Resolve CL constraints to symmetric pairwise CSR arrays.
+
+    This preserves Kruskal's native group-label path by remaining separate
+    from ``_resolve_cl_params``.  Borůvka callers use this helper because
+    the Borůvka CL kernels accept only pairwise CSR constraints.
+
+    Parameters
+    ----------
+    n : int
+        Number of vertices (samples).
+    cannot_link : scipy sparse matrix or None
+        Pairwise CL constraint matrix.
+    validate_cannot_link : bool
+        If True, validate and symmetrize ``cannot_link``.
+    cannot_link_groups : array-like or None
+        Group-label CL constraints to materialize as pairwise constraints.
+
+    Returns
+    -------
+    cl_indices : int32[:]
+        CSR column indices.
+    cl_indptr : int32[:]
+        CSR row pointers.
+    """
+    if cannot_link is not None and cannot_link_groups is not None:
+        raise ValueError(
+            "cannot_link and cannot_link_groups are mutually exclusive. "
+            "Provide one or the other, not both."
+        )
+
+    if cannot_link is not None:
+        return _validate_cannot_link(
+            cannot_link, n, validate=validate_cannot_link
+        )
+
+    if cannot_link_groups is not None:
+        cannot_link = _cannot_link_groups_to_sparse(cannot_link_groups, n)
+        return _validate_cannot_link(cannot_link, n, validate=False)
+
+    return np.empty(0, dtype=np.int32), np.zeros(n + 1, dtype=np.int32)
+
+
 def _resolve_cl_params(n, cannot_link=None, validate_cannot_link=True,
                        cannot_link_groups=None):
     """

@@ -378,8 +378,9 @@ def compute_minimum_spanning_tree(
         - int  : approximate MST via KNN subgraph with this many neighbors.
     cannot_link : scipy sparse matrix or None
         Symmetric sparse matrix of cannot-link constraints.  Entry (i, j) != 0
-        means samples i and j must not co-cluster.  Only supported with
-        ``algorithm='kruskal'``.  Mutually exclusive with
+        means samples i and j must not co-cluster.  Supported by Kruskal and
+        by Borůvka for native euclidean and sparse precomputed routes.
+        Not supported on pynndescent-backed routes.  Mutually exclusive with
         ``cannot_link_groups``.
     validate_cannot_link : bool
         If True (default), validate and symmetrize the cannot-link matrix
@@ -391,9 +392,10 @@ def compute_minimum_spanning_tree(
         where samples sharing the same non-negative label cannot co-cluster.
         ``-1`` means unconstrained.  This is an O(n) alternative to the
         O(n * k^2) sparse ``cannot_link`` matrix for block-diagonal
-        constraint structures (e.g., same-session, same-batch).  Only
-        supported with ``algorithm='kruskal'``.  Mutually exclusive with
-        ``cannot_link``.
+        constraint structures (e.g., same-session, same-batch).  Kruskal uses
+        a native group path; Borůvka materializes groups as pairwise
+        constraints.  Not supported on pynndescent-backed routes.  Mutually
+        exclusive with ``cannot_link``.
     metric_kwds : dict or None
         Additional keyword arguments for the distance metric (pynndescent only).
 
@@ -417,12 +419,7 @@ def compute_minimum_spanning_tree(
             "Provide one or the other, not both."
         )
 
-    _has_cl = cannot_link is not None or cannot_link_groups is not None
-    if _has_cl and algorithm != "kruskal":
-        raise ValueError(
-            "cannot_link constraints are only supported with "
-            "algorithm='kruskal'. Got algorithm=%r." % algorithm
-        )
+    has_cl = cannot_link is not None or cannot_link_groups is not None
 
     if metric == "precomputed":
         if sample_weights is not None:
@@ -439,6 +436,22 @@ def compute_minimum_spanning_tree(
                 validate_cannot_link=validate_cannot_link,
                 cannot_link_groups=cannot_link_groups,
             )
+        elif has_cl:
+            from .kruskal import _cannot_link_groups_to_sparse
+            from .precomputed import compute_mst_from_precomputed_sparse_boruvka_cl
+
+            if cannot_link_groups is not None:
+                cannot_link = _cannot_link_groups_to_sparse(
+                    cannot_link_groups, data.shape[0]
+                )
+                validate_cannot_link = False
+
+            return compute_mst_from_precomputed_sparse_boruvka_cl(
+                data,
+                min_samples,
+                cannot_link=cannot_link,
+                validate_cannot_link=validate_cannot_link,
+            )
         else:
             from .precomputed import compute_mst_from_precomputed_sparse
 
@@ -447,6 +460,12 @@ def compute_minimum_spanning_tree(
     if metric not in ("euclidean", "precomputed") or (
         data.shape[1] > 30 and sample_weights is None
     ):
+        if has_cl:
+            raise ValueError(
+                "cannot_link constraints are not supported on pynndescent-backed "
+                "routes. Use metric='euclidean' with native KD-tree routing, "
+                "metric='precomputed', or omit cannot_link constraints."
+            )
         if sample_weights is not None:
             raise NotImplementedError(
                 "sample_weights is not supported for non-euclidean metrics at this time."
@@ -480,17 +499,36 @@ def compute_minimum_spanning_tree(
         )
     else:
         n_threads = numba.get_num_threads()
-        edges, neighbors, core_distances = parallel_boruvka(
-            numba_tree,
-            n_threads,
-            min_samples=min_samples,
-            sample_weights=(
-                sample_weights
-                if sample_weights is not None
-                else np.empty(1, dtype=np.float32)
-            ),
-            reproducible=reproducible,
-        )
+        if has_cl:
+            from .boruvka_cl import parallel_boruvka_cl
+            from .kruskal import _resolve_pairwise_cl_params
+
+            cl_indices, cl_indptr = _resolve_pairwise_cl_params(
+                data.shape[0],
+                cannot_link=cannot_link,
+                validate_cannot_link=validate_cannot_link,
+                cannot_link_groups=cannot_link_groups,
+            )
+            edges, neighbors, core_distances = parallel_boruvka_cl(
+                numba_tree,
+                n_threads,
+                min_samples=min_samples,
+                cl_indices=cl_indices,
+                cl_indptr=cl_indptr,
+                sample_weights=sample_weights,
+            )
+        else:
+            edges, neighbors, core_distances = parallel_boruvka(
+                numba_tree,
+                n_threads,
+                min_samples=min_samples,
+                sample_weights=(
+                    sample_weights
+                    if sample_weights is not None
+                    else np.empty(1, dtype=np.float32)
+                ),
+                reproducible=reproducible,
+            )
         return edges, neighbors, core_distances
 
 
@@ -582,8 +620,11 @@ class HDBSCAN(ClusterMixin, BaseEstimator):
 
     Cannot-link constraints
     -----------------------
-    Two mutually exclusive modes are supported (both require
-    ``algorithm='kruskal'``):
+    Two mutually exclusive modes are supported.  Kruskal supports both modes
+    directly.  Borůvka supports cannot-link constraints on native euclidean
+    and sparse precomputed routes; group labels are materialized as pairwise
+    constraints for Borůvka.  Pynndescent-backed routes do not support
+    cannot-link constraints.
 
     * **Pairwise** (``cannot_link``): an ``(n, n)`` sparse boolean matrix
       where entry ``(i, j) != 0`` forbids samples *i* and *j* from
@@ -626,7 +667,8 @@ class HDBSCAN(ClusterMixin, BaseEstimator):
         Number of nearest neighbors for KNN graph (Kruskal only).
     cannot_link : scipy sparse matrix or None
         Pairwise cannot-link constraint matrix.  Mutually exclusive with
-        ``cannot_link_groups``.
+        ``cannot_link_groups``.  Supported by Kruskal and by Borůvka on
+        native euclidean and sparse precomputed routes.
     validate_cannot_link : bool
         If True, validate and symmetrize the CL matrix.
     cannot_link_groups : array-like of int or None
@@ -936,7 +978,8 @@ class PLSCAN(ClusterMixin, BaseEstimator):
 
     algorithm : str, default='boruvka'
         The MST algorithm to use.  Must be ``'boruvka'`` or ``'kruskal'``.
-        ``'kruskal'`` is required when using ``cannot_link`` constraints.
+        Cannot-link constraints are supported by Kruskal and by Borůvka on
+        native euclidean and sparse precomputed routes.
 
     knn_k : int or None, default=None
         Number of nearest neighbours to compute when building the MST.
@@ -944,8 +987,8 @@ class PLSCAN(ClusterMixin, BaseEstimator):
 
     cannot_link : array-like or None, default=None
         An array of pairs ``(i, j)`` of sample indices that must not be
-        placed in the same cluster.  Only supported with
-        ``algorithm='kruskal'``.
+        placed in the same cluster.  Supported by Kruskal and by Borůvka on
+        native euclidean and sparse precomputed routes.
 
     validate_cannot_link : bool, default=True
         Whether to validate ``cannot_link`` constraints before clustering.
@@ -1064,12 +1107,6 @@ class PLSCAN(ClusterMixin, BaseEstimator):
         if self.algorithm not in ("boruvka", "kruskal"):
             raise ValueError(
                 "algorithm must be 'boruvka' or 'kruskal'. Got: %s" % self.algorithm
-            )
-
-        if self.cannot_link is not None and self.algorithm != "kruskal":
-            raise ValueError(
-                "cannot_link constraints are only supported with "
-                "algorithm='kruskal'. Got algorithm=%r." % self.algorithm
             )
 
     def fit_predict(self, X, y=None, sample_weight=None, **fit_params):

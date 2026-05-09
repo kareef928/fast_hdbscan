@@ -23,7 +23,7 @@ import numpy as np
 import scipy.sparse
 import numba
 
-from .core_graph import CoreGraph, boruvka_mst
+from .core_graph import CoreGraph, boruvka_mst, boruvka_mst_cl
 from .variables import NUMBA_CACHE
 
 
@@ -468,6 +468,91 @@ def compute_mst_from_precomputed_sparse(X, min_samples):
         mst_edges = bridge_forest_with_inf(mst_edges, component_labels, n)
 
     # 6. Restore float64 precision: recompute MRD exactly for each MST edge.
+    mst_weights = _patch_mst_weights(
+        mst_edges, X_sym.data, X_sym.indices, X_sym.indptr, core_distances
+    )
+    mst_edges = np.column_stack([mst_edges[:, :2], mst_weights])
+
+    return mst_edges, neighbors, core_distances
+
+
+def compute_mst_from_precomputed_sparse_boruvka_cl(
+    X,
+    min_samples,
+    cannot_link=None,
+    validate_cannot_link=True,
+    band_fraction=np.inf,
+):
+    """
+    Compute the MST from a sparse precomputed graph using CL-constrained
+    Borůvka.
+
+    This follows the same sparse precomputed pipeline as
+    ``compute_mst_from_precomputed_sparse``, but validates pairwise
+    cannot-link constraints and passes them to ``boruvka_mst_cl``.
+
+    Parameters
+    ----------
+    X : scipy sparse matrix, shape (n, n)
+        Pairwise distance/weight graph. Missing entries = no edge (+inf).
+    min_samples : int
+        Number of neighbors to use for core distance computation.
+    cannot_link : scipy sparse matrix or None
+        Pairwise cannot-link constraint matrix. Entry (i, j) != 0 means
+        samples i and j must not co-cluster.
+    validate_cannot_link : bool
+        If True (default), validate and symmetrize the cannot-link matrix.
+        Set to False when the input is already a symmetric CSR of the
+        correct shape.
+    band_fraction : float
+        Forwarded to ``boruvka_mst_cl``. ``np.inf`` keeps the standard
+        Borůvka round behavior.
+
+    Returns
+    -------
+    edges : np.ndarray, shape (n-1, 3), columns [src, dst, mrd_weight]
+    neighbors : np.ndarray, int32, shape (n, k)
+    core_distances : np.ndarray, float64, shape (n,)
+    """
+    from .kruskal import _validate_cannot_link
+
+    validate_precomputed_sparse_graph(X)
+    n = X.shape[0]
+
+    # 1. Symmetrize: min weight per undirected pair, no diagonal, explicit zeros preserved.
+    X_sym = _symmetrize_min_csr(X)
+
+    # 2. Core distances and nearest-neighbor indices (parallel over nodes).
+    neighbors, core_distances = _core_distances_csr(
+        X_sym.data, X_sym.indices, X_sym.indptr, min_samples
+    )
+
+    # 3. Validate pairwise CL constraints.
+    cl_indices, cl_indptr = None, None
+    if cannot_link is not None:
+        cl_indices, cl_indptr = _validate_cannot_link(
+            cannot_link, n, validate=validate_cannot_link
+        )
+
+    # 4. Build CoreGraph with MRD weights, sorted per row (parallel over nodes).
+    weights, distances, cg_indices = _build_core_graph_csr(
+        X_sym.data, X_sym.indices, X_sym.indptr, core_distances
+    )
+    core_graph = CoreGraph(weights, distances, cg_indices, X_sym.indptr)
+
+    # 5. CL-constrained Borůvka MST when constraints are present.
+    if cl_indices is not None and len(cl_indices) > 0:
+        n_components, component_labels, mst_edges = boruvka_mst_cl(
+            core_graph, cl_indices, cl_indptr, band_fraction=band_fraction
+        )
+    else:
+        n_components, component_labels, mst_edges = boruvka_mst(core_graph)
+
+    # 6. Bridge disconnected components with +inf edges.
+    if n_components > 1:
+        mst_edges = bridge_forest_with_inf(mst_edges, component_labels, n)
+
+    # 7. Restore float64 precision: recompute MRD exactly for each MST edge.
     mst_weights = _patch_mst_weights(
         mst_edges, X_sym.data, X_sym.indices, X_sym.indptr, core_distances
     )

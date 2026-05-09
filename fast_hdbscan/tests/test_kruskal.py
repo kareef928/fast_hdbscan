@@ -785,12 +785,50 @@ class TestCannotLinkEntryPoints:
             assert labels[0] != labels[7], \
                 "CL-constrained points should not share a cluster"
 
-    def test_boruvka_with_cl_raises(self):
-        """algorithm='boruvka' + cannot_link raises ValueError."""
+    def test_boruvka_native_euclidean_cl(self):
+        """Native Euclidean Boruvka accepts cannot_link constraints."""
         cl = _make_cl_matrix(10, [(0, 5)])
-        with pytest.raises(ValueError, match="cannot_link"):
+        mst, neighbors, core_dists = compute_minimum_spanning_tree(
+            np.random.RandomState(11).randn(10, 2),
+            min_samples=2,
+            algorithm="boruvka",
+            cannot_link=cl,
+        )
+        assert mst.shape == (9, 3)
+        assert neighbors.shape[0] == 10
+        assert core_dists.shape == (10,)
+
+    def test_boruvka_precomputed_cl(self):
+        """Sparse precomputed Boruvka accepts cannot_link constraints."""
+        X = np.random.RandomState(12).randn(12, 2)
+        G = _full_pairwise_sparse(X)
+        cl = _make_cl_matrix(12, [(0, 1)])
+
+        labels, probs = fast_hdbscan(
+            G,
+            min_cluster_size=3,
+            min_samples=2,
+            metric="precomputed",
+            algorithm="boruvka",
+            cannot_link=cl,
+        )
+        assert labels.shape == (12,)
+        assert probs.shape == (12,)
+        if labels[0] != -1 and labels[1] != -1:
+            assert labels[0] != labels[1]
+
+    def test_boruvka_pynndescent_route_rejects_cl(self):
+        """pynndescent-backed routes still reject cannot_link constraints."""
+        n = 12
+        X = np.random.RandomState(13).randn(n, 31)
+        cl = _make_cl_matrix(n, [(0, 1)])
+
+        with pytest.raises(ValueError, match="pynndescent-backed"):
             compute_minimum_spanning_tree(
-                np.random.randn(10, 2), algorithm="boruvka", cannot_link=cl,
+                X,
+                min_samples=2,
+                algorithm="boruvka",
+                cannot_link=cl,
             )
 
     def test_cl_none_matches_unconstrained(self):
@@ -1631,15 +1669,21 @@ class TestCannotLinkGroupsEntryPoints:
                 cannot_link=cl, cannot_link_groups=group_labels,
             )
 
-    def test_boruvka_with_groups_raises(self):
-        """algorithm='boruvka' + cannot_link_groups raises ValueError."""
+    def test_boruvka_native_euclidean_groups(self):
+        """Native Euclidean Boruvka accepts cannot_link_groups."""
         n = 10
-        group_labels = np.zeros(n, dtype=np.int32)
-        with pytest.raises(ValueError, match="cannot_link"):
-            compute_minimum_spanning_tree(
-                np.random.randn(n, 2), algorithm="boruvka",
-                cannot_link_groups=group_labels,
-            )
+        group_labels = np.full(n, -1, dtype=np.int32)
+        group_labels[[0, 5]] = 0
+
+        mst, neighbors, core_dists = compute_minimum_spanning_tree(
+            np.random.RandomState(14).randn(n, 2),
+            min_samples=2,
+            algorithm="boruvka",
+            cannot_link_groups=group_labels,
+        )
+        assert mst.shape == (n - 1, 3)
+        assert neighbors.shape[0] == n
+        assert core_dists.shape == (n,)
 
     def test_cl_enforced_in_labels(self):
         """Same-group samples end up in different clusters or noise."""
