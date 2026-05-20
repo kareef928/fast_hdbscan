@@ -3,8 +3,9 @@
 Wires cannot-link pruning directly into the KD-tree dual-tree traversal so the
 MST can be computed without materializing an O(nk) or O(n^2) CSR.
 
-Key entry point: ``parallel_boruvka_cl``.  Returns the same triple as
-``parallel_boruvka``: ``(edges, neighbors, core_distances)``.
+Key entry point: ``parallel_boruvka_cl``. Returns the same triple as
+``parallel_boruvka`` (``edges, neighbors, core_distances``), and can optionally
+return a fourth ``banding_metadata`` dictionary.
 """
 
 import numba
@@ -19,6 +20,34 @@ from .core_graph_cl import validate_and_prune_merges
 from .disjoint_set import ds_rank_create, ds_find, ds_union_by_rank
 from .numba_kdtree import parallel_tree_query, rdist, point_to_node_lower_bound_rdist
 from .variables import NUMBA_CACHE
+
+
+BAND_MODE_ROUND_MIN_RELATIVE = "round_min_relative"
+BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE = "global_mrd_quantile_schedule"
+BAND_MODES = (
+    BAND_MODE_ROUND_MIN_RELATIVE,
+    BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE,
+)
+
+
+def _validate_banding_inputs(*, band_fraction, band_mode):
+    """Validate ``band_fraction``/``band_mode`` and return float band_fraction."""
+    if band_mode not in BAND_MODES:
+        raise ValueError(f"Unknown band_mode={band_mode!r}; valid modes={BAND_MODES}.")
+
+    try:
+        band_fraction = float(band_fraction)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"band_fraction must be a real number; got {band_fraction!r}."
+        ) from exc
+
+    if np.isnan(band_fraction):
+        raise ValueError("band_fraction must not be NaN.")
+    if band_fraction < 0.0:
+        raise ValueError(f"band_fraction must be non-negative; got {band_fraction}.")
+
+    return band_fraction
 
 
 def _extract_cl_pair_arrays_from_csr(cl_indices, cl_indptr):
@@ -347,7 +376,7 @@ def _component_aware_query_recursion_cl(
 )
 def _boruvka_tree_query_cl(
     tree, node_components, point_components, core_distances,
-    forbid_indices, forbid_indptr,
+    forbid_indices, forbid_indptr, distance_upper_bound,
 ):
     """
     CL-aware parallel dual-tree query.
@@ -357,9 +386,11 @@ def _boruvka_tree_query_cl(
     (as captured in ``forbid_indices/forbid_indptr``) are accepted.
     """
     n_pts = tree.data.shape[0]
-    candidate_distances = np.full(n_pts, np.inf, dtype=np.float32)
+    candidate_distances = np.full(n_pts, distance_upper_bound, dtype=np.float32)
     candidate_indices = np.full(n_pts, -1, dtype=np.int32)
-    component_nearest_neighbor_dist = np.full(n_pts, np.inf, dtype=np.float32)
+    component_nearest_neighbor_dist = np.full(
+        n_pts, distance_upper_bound, dtype=np.float32
+    )
 
     data = tree.data.astype(np.float32)
 
@@ -388,6 +419,207 @@ def _boruvka_tree_query_cl(
         )
 
     return candidate_distances, candidate_indices
+
+
+@numba.njit(cache=NUMBA_CACHE)
+def _collect_knn_mrd_weights(knn_indices, knn_distances, core_distances):
+    """
+    Collect mutual-reachability weights from already-computed kNNs.
+
+    The Euclidean Boruvka path stores internal weights as squared Euclidean
+    distances (``rdist``) until the final ``sqrt`` conversion.  The collected
+    weights intentionally stay in those internal units so thresholds can be
+    used as query bounds without conversion.
+    """
+    max_observed = knn_indices.shape[0] * (knn_indices.shape[1] - 1)
+    weights = np.empty(max_observed, dtype=np.float32)
+    n_observed = np.int64(0)
+
+    for i in range(knn_indices.shape[0]):
+        for j in range(1, knn_indices.shape[1]):
+            neighbor = knn_indices[i, j]
+            if neighbor < 0 or neighbor == i:
+                continue
+            weight = knn_distances[i, j]
+            if core_distances[i] > weight:
+                weight = core_distances[i]
+            if core_distances[neighbor] > weight:
+                weight = core_distances[neighbor]
+            if not np.isfinite(weight):
+                continue
+            weights[n_observed] = weight
+            n_observed += np.int64(1)
+
+    return weights[:n_observed]
+
+
+def _make_empty_banding_metadata(*, band_mode):
+    """Return standard band metadata fields for modes without a finite estimate."""
+    return {
+        "band_mode": band_mode,
+        "band_range_low_internal": None,
+        "band_range_high_internal": None,
+        "band_threshold_internal": None,
+        "band_range_n_observed": 0,
+        "band_schedule_n_levels": None,
+        "band_schedule_first_threshold_internal": None,
+        "band_schedule_last_finite_threshold_internal": None,
+        "band_schedule_levels_visited": None,
+        "band_schedule_n_advances": None,
+        "band_schedule_final_threshold_internal": None,
+    }
+
+
+def _compute_global_mrd_threshold(
+    *,
+    band_fraction,
+    band_mode,
+    neighbors,
+    distances,
+    core_distances,
+    sample_weights,
+):
+    """
+    Resolve banding semantics into a single internal-distance cutoff.
+
+    ``round_min_relative`` preserves the legacy per-round behavior.
+    ``global_mrd_quantile_schedule`` returns an increasing threshold schedule
+    and finishes with an unbounded level. In global scheduled mode,
+    ``band >= 1.0`` and ``band = inf`` are both explicitly unbounded.
+    """
+    band_fraction = _validate_banding_inputs(
+        band_fraction=band_fraction, band_mode=band_mode
+    )
+
+    if band_mode == BAND_MODE_ROUND_MIN_RELATIVE:
+        return np.inf, _make_empty_banding_metadata(band_mode=band_mode)
+
+    if band_mode == BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE:
+        thresholds, metadata = _compute_global_mrd_quantile_schedule(
+            band_fraction=band_fraction,
+            neighbors=neighbors,
+            distances=distances,
+            core_distances=core_distances,
+            sample_weights=sample_weights,
+        )
+        return thresholds, metadata
+
+    raise ValueError(f"Unhandled band_mode={band_mode!r}.")
+
+
+def _compute_global_mrd_quantile_schedule(
+    *,
+    band_fraction,
+    neighbors,
+    distances,
+    core_distances,
+    sample_weights,
+):
+    """
+    Build an increasing absolute-threshold schedule from observed MRD quantiles.
+
+    A finite ``band_fraction`` is interpreted as the fraction of the observed
+    kNN/core-distance weight distribution processed per level.  For example,
+    ``band_fraction=0.1`` uses roughly 10%, 20%, ..., 100% quantile thresholds,
+    then a final unbounded level.  This keeps the band global while preventing
+    finite bands from being final hard caps.
+    """
+    band_fraction = float(band_fraction)
+    if not np.isfinite(band_fraction) or band_fraction >= 1.0:
+        metadata = _make_empty_banding_metadata(
+            band_mode=BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE
+        )
+        metadata["band_schedule_n_levels"] = 1
+        metadata["band_schedule_first_threshold_internal"] = None
+        metadata["band_schedule_last_finite_threshold_internal"] = None
+        metadata["band_schedule_final_threshold_internal"] = float("inf")
+        return np.asarray([np.inf], dtype=np.float64), metadata
+    if band_fraction <= 0.0:
+        raise ValueError(
+            f"{BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE!r} requires "
+            f"0 < band_fraction < 1; got {band_fraction}."
+        )
+    if sample_weights is not None:
+        raise ValueError(
+            f"{BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE!r} is currently implemented "
+            "only for unweighted Euclidean Boruvka-CL runs."
+        )
+
+    weights = _collect_knn_mrd_weights(neighbors, distances, core_distances)
+    if weights.shape[0] == 0:
+        metadata = _make_empty_banding_metadata(
+            band_mode=BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE
+        )
+        metadata["band_schedule_n_levels"] = 1
+        metadata["band_schedule_final_threshold_internal"] = float("inf")
+        return np.asarray([np.inf], dtype=np.float64), metadata
+
+    probabilities = np.arange(
+        band_fraction,
+        1.0 + 0.5 * band_fraction,
+        band_fraction,
+        dtype=np.float64,
+    )
+    probabilities = np.clip(probabilities, 0.0, 1.0)
+    if probabilities[-1] < 1.0:
+        probabilities = np.concatenate((probabilities, np.asarray([1.0])))
+
+    thresholds_finite = np.quantile(weights.astype(np.float64), probabilities)
+    thresholds_finite = np.unique(thresholds_finite.astype(np.float64))
+    thresholds = np.concatenate((thresholds_finite, np.asarray([np.inf])))
+
+    weight_low = float(np.min(weights))
+    weight_high = float(np.max(weights))
+    first_threshold = float(thresholds_finite[0])
+    last_finite_threshold = float(thresholds_finite[-1])
+    metadata = {
+        "band_mode": BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE,
+        "band_range_low_internal": weight_low,
+        "band_range_high_internal": weight_high,
+        "band_threshold_internal": first_threshold,
+        "band_range_n_observed": int(weights.shape[0]),
+        "band_schedule_n_levels": int(thresholds.shape[0]),
+        "band_schedule_first_threshold_internal": first_threshold,
+        "band_schedule_last_finite_threshold_internal": last_finite_threshold,
+        "band_schedule_levels_visited": None,
+        "band_schedule_n_advances": None,
+        "band_schedule_final_threshold_internal": None,
+    }
+    return thresholds, metadata
+
+
+def _next_query_upper_bound(threshold):
+    """Return a float32 KD-tree query bound that includes threshold-equal edges."""
+    if not np.isfinite(threshold):
+        return np.float32(np.inf)
+    return np.nextafter(np.float32(threshold), np.float32(np.inf))
+
+
+def _advance_global_band_threshold(
+    *,
+    thresholds,
+    level_index,
+):
+    """Move to the next global threshold level if one exists."""
+    if level_index + 1 >= thresholds.shape[0]:
+        return level_index, False
+    return level_index + 1, True
+
+
+def _advance_global_band_state(*, thresholds, level_index, n_advances):
+    """Advance a scheduled global threshold and return the updated state."""
+    next_level_index, advanced = _advance_global_band_threshold(
+        thresholds=thresholds,
+        level_index=level_index,
+    )
+    if not advanced:
+        return level_index, n_advances, float(thresholds[level_index]), False
+    return (
+        next_level_index,
+        n_advances + 1,
+        float(thresholds[next_level_index]),
+        True,
+    )
 
 
 @numba.njit(parallel=True, cache=NUMBA_CACHE)
@@ -530,6 +762,8 @@ def parallel_boruvka_cl(
     cl_indptr,
     sample_weights=None,
     band_fraction=np.inf,
+    band_mode=BAND_MODE_ROUND_MIN_RELATIVE,
+    return_banding_metadata=False,
 ):
     """
     CL-constrained dual-tree Boruvka MST for Euclidean data.
@@ -548,11 +782,19 @@ def parallel_boruvka_cl(
     cl_indptr      : int32[:], CSR row pointers (length n+1).
     sample_weights : float32[:] or None
     band_fraction  : float
-        Per-round weight window: only candidates within
-        ``w_min * (1 + band_fraction)`` of the round minimum are merged.
-        ``np.inf`` = no banding (standard Boruvka, default).
-        ``0.05``   = tight band (close to Kruskal ordering, lower
-        over-fragmentation under CL constraints).
+        Banding value interpreted according to ``band_mode``. Must be
+        non-negative. ``np.inf`` is allowed.
+    band_mode : str
+        ``"round_min_relative"`` preserves the legacy per-round window:
+        candidates within ``w_min * (1 + band_fraction)`` of the current round
+        minimum are merged. ``"global_mrd_quantile_schedule"`` uses increasing
+        absolute cutoffs from the global initial kNN/core-distance distribution,
+        then finishes with an unbounded level so finite bands do not strand the
+        forest. In scheduled mode, ``band >= 1.0`` and ``np.inf`` both mean no
+        cutoff.
+    return_banding_metadata : bool
+        If True, return a fourth dict with the estimated band range and
+        threshold in internal squared-distance units.
 
     Returns
     -------
@@ -565,6 +807,9 @@ def parallel_boruvka_cl(
     """
     from .precomputed import bridge_forest_with_inf
 
+    band_fraction = _validate_banding_inputs(
+        band_fraction=band_fraction, band_mode=band_mode
+    )
     n = tree.data.shape[0]
 
     # Delegate to vanilla Boruvka when there are no cannot-link constraints.
@@ -572,10 +817,14 @@ def parallel_boruvka_cl(
         boruvka_sample_weights = (
             np.zeros(1, dtype=np.float32) if sample_weights is None else sample_weights
         )
-        return parallel_boruvka(
+        result = parallel_boruvka(
             tree, n_threads, min_samples=min_samples,
             sample_weights=boruvka_sample_weights, reproducible=False,
         )
+        if return_banding_metadata:
+            metadata = _make_empty_banding_metadata(band_mode=band_mode)
+            return (*result, metadata)
+        return result
 
     # Compute core distances and neighbors using the same rules as parallel_boruvka.
     if sample_weights is not None:
@@ -598,7 +847,27 @@ def parallel_boruvka_cl(
             tree, tree.data, k=2, output_rdist=True
         )
 
-    use_banding = band_fraction < 1e30
+    global_band_plan, global_band_metadata = _compute_global_mrd_threshold(
+        band_fraction=band_fraction,
+        band_mode=band_mode,
+        neighbors=neighbors,
+        distances=distances,
+        core_distances=core_distances,
+        sample_weights=sample_weights,
+    )
+    use_round_min_banding = (
+        band_mode == BAND_MODE_ROUND_MIN_RELATIVE and band_fraction < 1e30
+    )
+    use_threshold_schedule = band_mode == BAND_MODE_GLOBAL_MRD_QUANTILE_SCHEDULE
+    if use_threshold_schedule:
+        global_band_thresholds = global_band_plan.astype(np.float64)
+    else:
+        global_band_thresholds = np.asarray([float(global_band_plan)], dtype=np.float64)
+    global_band_level_index = 0
+    global_band_n_advances = 0
+    global_band_threshold = float(global_band_thresholds[global_band_level_index])
+    use_global_banding = np.isfinite(global_band_threshold)
+    candidate_distance_upper_bound = _next_query_upper_bound(global_band_threshold)
 
     # Extract flat cannot-link pair arrays once, then rebuild component-level
     # constraints each round.
@@ -627,11 +896,17 @@ def parallel_boruvka_cl(
     )
 
     if n_init > 0:
-        # Drop kNN candidates above w_min * (1 + band_fraction).
-        if use_banding and n_init > 0:
+        # Drop kNN candidates above the configured band before validation.
+        if use_round_min_banding and n_init > 0:
             w_min_init = float(np.min(init_wt))
             band_hi_init = w_min_init * (1.0 + band_fraction)
             mask_init = init_wt <= band_hi_init
+            init_src = init_src[mask_init]
+            init_dst = init_dst[mask_init]
+            init_wt = init_wt[mask_init]
+            n_init = int(mask_init.sum())
+        elif use_global_banding and n_init > 0:
+            mask_init = init_wt <= global_band_threshold
             init_src = init_src[mask_init]
             init_dst = init_dst[mask_init]
             init_wt = init_wt[mask_init]
@@ -689,6 +964,8 @@ def parallel_boruvka_cl(
 
     # Main Boruvka-CL loop.
     while n_components > 1:
+        use_global_banding = np.isfinite(global_band_threshold)
+        candidate_distance_upper_bound = _next_query_upper_bound(global_band_threshold)
         if M_pairs > 0:
             forbid_indices, forbid_indptr = _build_forbidden_components_csr(
                 cl_pair_u, cl_pair_v, point_components, n
@@ -704,6 +981,7 @@ def parallel_boruvka_cl(
             core_distances,
             forbid_indices,
             forbid_indptr,
+            candidate_distance_upper_bound,
         )
 
         cand_src, cand_dst, cand_wt, n_cand = _select_components_cl(
@@ -711,9 +989,22 @@ def parallel_boruvka_cl(
         )
 
         if n_cand == 0:
+            if use_threshold_schedule:
+                (
+                    global_band_level_index,
+                    global_band_n_advances,
+                    global_band_threshold,
+                    advanced,
+                ) = _advance_global_band_state(
+                    thresholds=global_band_thresholds,
+                    level_index=global_band_level_index,
+                    n_advances=global_band_n_advances,
+                )
+                if advanced:
+                    continue
             break
 
-        if use_banding:
+        if use_round_min_banding:
             w_min = float(np.min(cand_wt[:n_cand]))
             band_hi = w_min * (1.0 + band_fraction)
             mask = cand_wt[:n_cand] <= band_hi
@@ -722,6 +1013,40 @@ def parallel_boruvka_cl(
             cand_wt = cand_wt[mask]
             n_cand = int(mask.sum())
             if n_cand == 0:
+                if use_threshold_schedule:
+                    (
+                        global_band_level_index,
+                        global_band_n_advances,
+                        global_band_threshold,
+                        advanced,
+                    ) = _advance_global_band_state(
+                        thresholds=global_band_thresholds,
+                        level_index=global_band_level_index,
+                        n_advances=global_band_n_advances,
+                    )
+                    if advanced:
+                        continue
+                break
+        elif use_global_banding:
+            mask = cand_wt[:n_cand] <= global_band_threshold
+            cand_src = cand_src[mask]
+            cand_dst = cand_dst[mask]
+            cand_wt = cand_wt[mask]
+            n_cand = int(mask.sum())
+            if n_cand == 0:
+                if use_threshold_schedule:
+                    (
+                        global_band_level_index,
+                        global_band_n_advances,
+                        global_band_threshold,
+                        advanced,
+                    ) = _advance_global_band_state(
+                        thresholds=global_band_thresholds,
+                        level_index=global_band_level_index,
+                        n_advances=global_band_n_advances,
+                    )
+                    if advanced:
+                        continue
                 break
 
         surv_src, surv_dst, surv_wt, n_surviving = validate_and_prune_merges(
@@ -743,6 +1068,19 @@ def parallel_boruvka_cl(
         )
 
         if n_surviving == 0:
+            if use_threshold_schedule:
+                (
+                    global_band_level_index,
+                    global_band_n_advances,
+                    global_band_threshold,
+                    advanced,
+                ) = _advance_global_band_state(
+                    thresholds=global_band_thresholds,
+                    level_index=global_band_level_index,
+                    n_advances=global_band_n_advances,
+                )
+                if advanced:
+                    continue
             break
 
         new_edges, n_added = _commit_edges_cl(
@@ -755,6 +1093,19 @@ def parallel_boruvka_cl(
         )
 
         if n_added == 0:
+            if use_threshold_schedule:
+                (
+                    global_band_level_index,
+                    global_band_n_advances,
+                    global_band_threshold,
+                    advanced,
+                ) = _advance_global_band_state(
+                    thresholds=global_band_thresholds,
+                    level_index=global_band_level_index,
+                    n_advances=global_band_n_advances,
+                )
+                if advanced:
+                    continue
             break
 
         all_edges = np.vstack((all_edges, new_edges[:n_added]))
@@ -771,4 +1122,17 @@ def parallel_boruvka_cl(
     if n_components > 1:
         all_edges = bridge_forest_with_inf(all_edges, point_components, n)
 
-    return all_edges, neighbors[:, 1:], np.sqrt(core_distances)
+    result = (all_edges, neighbors[:, 1:], np.sqrt(core_distances))
+    if return_banding_metadata:
+        if use_threshold_schedule:
+            global_band_metadata["band_schedule_levels_visited"] = int(
+                global_band_level_index + 1
+            )
+            global_band_metadata["band_schedule_n_advances"] = int(
+                global_band_n_advances
+            )
+            global_band_metadata["band_schedule_final_threshold_internal"] = float(
+                global_band_thresholds[global_band_level_index]
+            )
+        return (*result, global_band_metadata)
+    return result
