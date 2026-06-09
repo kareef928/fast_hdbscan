@@ -1345,6 +1345,353 @@ def validate_and_prune_merges(candidate_src, candidate_dst, candidate_wt,
 
 
 @numba.njit(cache=NUMBA_CACHE)
+def validate_and_prune_merges_dict(candidate_src, candidate_dst, candidate_wt,
+                                    n_candidates, constraints,
+                                    point_components, n_verts,
+                                    _adj_head, _adj_next, _adj_edge_idx,
+                                    _bfs_queue, _bfs_parent_edge, _bfs_visited,
+                                    _temp_parent, bfs_tie_fix):
+    """Maintained-tracker variant of ``validate_and_prune_merges`` (Q2).
+
+    Identical tentative-merge + BFS heaviest-edge cleanup, but the per-round
+    violation scan is driven by the **maintained component-constraint
+    dictionary** instead of re-reading the raw CL point-pairs.
+
+    For each involved component ``A`` we walk its forbidden peers
+    ``B in constraints[A]`` (canonical ``A < B``, both involved); if ``A`` and
+    ``B`` landed in the same tentative super-component we BFS the path and cut
+    its heaviest edge.  The dict's entries are already the deduplicated set of
+    forbidden *component* pairs, so this reproduces exactly the canonical-pair
+    (``dedup_mode=2``) behavior of ``validate_and_prune_merges`` -- the surviving
+    edge set is bit-identical -- while scanning the shrinking active forbidden
+    set rather than all C raw pairs.
+
+    ``constraints`` is the live ``Dict[int64 -> Dict[int64, int8]]``.
+    ``bfs_tie_fix`` matches the original (use 1 for the shipped behavior).
+    Returns the same 5-tuple as ``validate_and_prune_merges``.
+    """
+    counters = np.zeros(7, dtype=np.int64)
+
+    if n_candidates == 0:
+        return candidate_src[:0], candidate_dst[:0], candidate_wt[:0], 0, counters
+
+    # Merge tree edge arrays
+    tree_src = np.empty(n_candidates, dtype=np.int32)
+    tree_dst = np.empty(n_candidates, dtype=np.int32)
+    tree_wt = np.empty(n_candidates, dtype=np.float32)
+    tree_alive = np.ones(n_candidates, dtype=numba.boolean)
+
+    # Map edges to component space and collect involved components
+    involved_comps = np.empty(2 * n_candidates, dtype=np.int32)
+    n_involved = 0
+    for i in range(n_candidates):
+        s = point_components[candidate_src[i]]
+        d = point_components[candidate_dst[i]]
+        tree_src[i] = s
+        tree_dst[i] = d
+        tree_wt[i] = candidate_wt[i]
+        involved_comps[n_involved] = s
+        involved_comps[n_involved + 1] = d
+        n_involved += 2
+
+    # Deduplicate involved components
+    involved_comps = involved_comps[:n_involved]
+    involved_comps.sort()
+    n_unique = 0
+    for i in range(n_involved):
+        if i == 0 or involved_comps[i] != involved_comps[i - 1]:
+            involved_comps[n_unique] = involved_comps[i]
+            n_unique += 1
+    involved_comps = involved_comps[:n_unique]
+
+    # Involved-component membership set (O(1)).  Only pairs whose *both* endpoints
+    # were merged this round can become co-located, so the scan is scoped to it.
+    involved_set = numba.typed.Dict.empty(
+        key_type=numba.types.int64,
+        value_type=numba.types.int8,
+    )
+    for i in range(n_unique):
+        involved_set[np.int64(involved_comps[i])] = np.int8(1)
+
+    max_iters = n_candidates
+
+    for _iteration in range(max_iters):
+        counters[0] += np.int64(1)   ## n_scan_iterations
+
+        # Reset temp DSU only for involved components
+        for i in range(n_unique):
+            c = involved_comps[i]
+            _temp_parent[c] = c
+
+        # Reset adjacency only for involved components
+        for i in range(n_unique):
+            _adj_head[involved_comps[i]] = -1
+
+        adj_ptr = 0
+        for i in range(n_candidates):
+            if not tree_alive[i]:
+                continue
+            s = tree_src[i]
+            d = tree_dst[i]
+
+            rs = s
+            while _temp_parent[rs] != rs:
+                rs = _temp_parent[rs]
+            rd = d
+            while _temp_parent[rd] != rd:
+                rd = _temp_parent[rd]
+
+            if rs != rd:
+                _temp_parent[rd] = rs
+
+                _adj_next[adj_ptr] = _adj_head[s]
+                _adj_edge_idx[adj_ptr] = np.int32(i)
+                _adj_head[s] = np.int32(adj_ptr)
+                adj_ptr += 1
+
+                _adj_next[adj_ptr] = _adj_head[d]
+                _adj_edge_idx[adj_ptr] = np.int32(i)
+                _adj_head[d] = np.int32(adj_ptr)
+                adj_ptr += 1
+
+        # Path compression only for involved components
+        for i in range(n_unique):
+            c = involved_comps[i]
+            root = _temp_parent[c]
+            while _temp_parent[root] != root:
+                root = _temp_parent[root]
+            curr = c
+            while curr != root:
+                nxt = _temp_parent[curr]
+                _temp_parent[curr] = root
+                curr = nxt
+
+        # Dict-driven CL scan: iterate forbidden component-pairs (canonical A<B)
+        edges_to_remove = np.full(n_candidates, False, dtype=numba.boolean)
+        found_violation = False
+
+        for ai in range(n_unique):
+            comp_a = np.int64(involved_comps[ai])
+            if comp_a not in constraints:
+                continue
+            peers = constraints[comp_a]
+            for comp_b in peers:
+                counters[5] += np.int64(1)   ## raw scan-volume analogue (dict entries)
+                if comp_b <= comp_a:
+                    continue
+                if comp_b not in involved_set:
+                    continue
+
+                counters[1] += np.int64(1)   ## pairs reaching eligibility
+
+                if _temp_parent[comp_a] != _temp_parent[comp_b]:
+                    continue
+
+                counters[6] += np.int64(1)   ## unique violation pairs (BFS triggers)
+                heaviest, n_bfs_steps = _bfs_heaviest_edge(
+                    np.int32(comp_a), np.int32(comp_b), tree_src, tree_dst, tree_wt,
+                    tree_alive, n_candidates, _adj_head, _adj_next,
+                    _adj_edge_idx, _bfs_queue, _bfs_parent_edge, _bfs_visited,
+                    bfs_tie_fix,
+                )
+                counters[3] += n_bfs_steps   ## n_bfs_edges_traversed
+                if heaviest >= 0:
+                    edges_to_remove[heaviest] = True
+                    found_violation = True
+                    counters[2] += np.int64(1)   ## n_violations_found_total
+
+        if not found_violation:
+            break
+
+        for i in range(n_candidates):
+            if edges_to_remove[i]:
+                tree_alive[i] = False
+                counters[4] += np.int64(1)   ## n_edges_cut
+
+    # Collect surviving edges
+    n_surviving = 0
+    for i in range(n_candidates):
+        if tree_alive[i]:
+            n_surviving += 1
+
+    surv_src = np.empty(n_surviving, dtype=np.int32)
+    surv_dst = np.empty(n_surviving, dtype=np.int32)
+    surv_wt = np.empty(n_surviving, dtype=np.float32)
+    j = 0
+    for i in range(n_candidates):
+        if tree_alive[i]:
+            surv_src[j] = candidate_src[i]
+            surv_dst[j] = candidate_dst[i]
+            surv_wt[j] = candidate_wt[i]
+            j += 1
+
+    return surv_src, surv_dst, surv_wt, n_surviving, counters
+
+
+@numba.njit(cache=NUMBA_CACHE)
+def validate_and_prune_merges_csr(candidate_src, candidate_dst, candidate_wt,
+                                   n_candidates, forbid_indices, forbid_indptr,
+                                   point_components, n_verts,
+                                   _adj_head, _adj_next, _adj_edge_idx,
+                                   _bfs_queue, _bfs_parent_edge, _bfs_visited,
+                                   _temp_parent, bfs_tie_fix):
+    """CSR-driven variant of ``validate_and_prune_merges``.
+
+    Identical tentative-merge + BFS heaviest-edge cleanup, but the per-round
+    violation scan iterates the **forbidden-components CSR that was already built
+    for query pruning** instead of re-walking the raw CL point-pairs.  The CSR
+    rows are exactly the deduplicated forbidden *component* pairs, so this
+    reproduces the canonical-pair behavior of ``validate_and_prune_merges`` (the
+    surviving edge set is bit-identical) while avoiding the second raw pass.
+
+    ``forbid_indices``/``forbid_indptr`` are component-keyed (``forbid_indptr``
+    has length ``n_verts + 1``); row ``A`` lists the components A cannot merge
+    with.  ``bfs_tie_fix`` matches the original (use 1 for the shipped behavior).
+    Returns the same 5-tuple as ``validate_and_prune_merges``.
+    """
+    counters = np.zeros(7, dtype=np.int64)
+
+    if n_candidates == 0:
+        return candidate_src[:0], candidate_dst[:0], candidate_wt[:0], 0, counters
+
+    # Merge tree edge arrays
+    tree_src = np.empty(n_candidates, dtype=np.int32)
+    tree_dst = np.empty(n_candidates, dtype=np.int32)
+    tree_wt = np.empty(n_candidates, dtype=np.float32)
+    tree_alive = np.ones(n_candidates, dtype=numba.boolean)
+
+    # Map edges to component space and collect involved components
+    involved_comps = np.empty(2 * n_candidates, dtype=np.int32)
+    n_involved = 0
+    for i in range(n_candidates):
+        s = point_components[candidate_src[i]]
+        d = point_components[candidate_dst[i]]
+        tree_src[i] = s
+        tree_dst[i] = d
+        tree_wt[i] = candidate_wt[i]
+        involved_comps[n_involved] = s
+        involved_comps[n_involved + 1] = d
+        n_involved += 2
+
+    involved_comps = involved_comps[:n_involved]
+    involved_comps.sort()
+    n_unique = 0
+    for i in range(n_involved):
+        if i == 0 or involved_comps[i] != involved_comps[i - 1]:
+            involved_comps[n_unique] = involved_comps[i]
+            n_unique += 1
+    involved_comps = involved_comps[:n_unique]
+
+    # Only pairs whose *both* endpoints were merged this round can co-locate.
+    involved_set = numba.typed.Dict.empty(
+        key_type=numba.types.int64,
+        value_type=numba.types.int8,
+    )
+    for i in range(n_unique):
+        involved_set[np.int64(involved_comps[i])] = np.int8(1)
+
+    max_iters = n_candidates
+
+    for _iteration in range(max_iters):
+        counters[0] += np.int64(1)
+
+        for i in range(n_unique):
+            c = involved_comps[i]
+            _temp_parent[c] = c
+        for i in range(n_unique):
+            _adj_head[involved_comps[i]] = -1
+
+        adj_ptr = 0
+        for i in range(n_candidates):
+            if not tree_alive[i]:
+                continue
+            s = tree_src[i]
+            d = tree_dst[i]
+            rs = s
+            while _temp_parent[rs] != rs:
+                rs = _temp_parent[rs]
+            rd = d
+            while _temp_parent[rd] != rd:
+                rd = _temp_parent[rd]
+            if rs != rd:
+                _temp_parent[rd] = rs
+                _adj_next[adj_ptr] = _adj_head[s]
+                _adj_edge_idx[adj_ptr] = np.int32(i)
+                _adj_head[s] = np.int32(adj_ptr)
+                adj_ptr += 1
+                _adj_next[adj_ptr] = _adj_head[d]
+                _adj_edge_idx[adj_ptr] = np.int32(i)
+                _adj_head[d] = np.int32(adj_ptr)
+                adj_ptr += 1
+
+        for i in range(n_unique):
+            c = involved_comps[i]
+            root = _temp_parent[c]
+            while _temp_parent[root] != root:
+                root = _temp_parent[root]
+            curr = c
+            while curr != root:
+                nxt = _temp_parent[curr]
+                _temp_parent[curr] = root
+                curr = nxt
+
+        # CSR-driven CL scan: iterate forbidden component-pairs (canonical A<B).
+        edges_to_remove = np.full(n_candidates, False, dtype=numba.boolean)
+        found_violation = False
+
+        for ai in range(n_unique):
+            comp_a = involved_comps[ai]
+            for p in range(forbid_indptr[comp_a], forbid_indptr[comp_a + 1]):
+                comp_b = forbid_indices[p]
+                counters[5] += np.int64(1)
+                if comp_b <= comp_a:
+                    continue
+                if np.int64(comp_b) not in involved_set:
+                    continue
+                counters[1] += np.int64(1)
+                if _temp_parent[comp_a] != _temp_parent[comp_b]:
+                    continue
+                counters[6] += np.int64(1)
+                heaviest, n_bfs_steps = _bfs_heaviest_edge(
+                    comp_a, comp_b, tree_src, tree_dst, tree_wt,
+                    tree_alive, n_candidates, _adj_head, _adj_next,
+                    _adj_edge_idx, _bfs_queue, _bfs_parent_edge, _bfs_visited,
+                    bfs_tie_fix,
+                )
+                counters[3] += n_bfs_steps
+                if heaviest >= 0:
+                    edges_to_remove[heaviest] = True
+                    found_violation = True
+                    counters[2] += np.int64(1)
+
+        if not found_violation:
+            break
+
+        for i in range(n_candidates):
+            if edges_to_remove[i]:
+                tree_alive[i] = False
+                counters[4] += np.int64(1)
+
+    n_surviving = 0
+    for i in range(n_candidates):
+        if tree_alive[i]:
+            n_surviving += 1
+
+    surv_src = np.empty(n_surviving, dtype=np.int32)
+    surv_dst = np.empty(n_surviving, dtype=np.int32)
+    surv_wt = np.empty(n_surviving, dtype=np.float32)
+    j = 0
+    for i in range(n_candidates):
+        if tree_alive[i]:
+            surv_src[j] = candidate_src[i]
+            surv_dst[j] = candidate_dst[i]
+            surv_wt[j] = candidate_wt[i]
+            j += 1
+
+    return surv_src, surv_dst, surv_wt, n_surviving, counters
+
+
+@numba.njit(cache=NUMBA_CACHE)
 def boruvka_mst_cl(graph, cl_indices, cl_indptr, band_fraction=np.inf,
                     overwrite=False, dedup_mode=2, bfs_tie_fix=1,
                     cl_struct_mode=1):
