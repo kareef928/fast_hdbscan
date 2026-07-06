@@ -11,6 +11,9 @@ return a fourth ``banding_metadata`` dictionary.
 import numba
 import numpy as np
 
+from numba import types
+from numba.typed import Dict
+
 from .boruvka import (
     parallel_boruvka,
     update_component_vectors,
@@ -20,6 +23,13 @@ from .core_graph_cl import validate_and_prune_merges
 from .disjoint_set import ds_rank_create, ds_find, ds_union_by_rank
 from .numba_kdtree import parallel_tree_query, rdist, point_to_node_lower_bound_rdist
 from .variables import NUMBA_CACHE
+
+
+# Inner "set" type for the component-constraint dictionary: a typed Dict used as
+# a hash set (key = forbidden component root, value = dummy int8).  Membership
+# tests, insertion, and deletion are all O(1).  This backs the ``mini_kruskal``
+# merge that replaced the merge-then-break ``current`` strategy.
+_CL_SET_TYPE = types.DictType(types.int64, types.int8)
 
 
 BAND_MODE_ROUND_MIN_RELATIVE = "round_min_relative"
@@ -754,6 +764,133 @@ def _commit_edges_cl(
     return new_edges, n_added
 
 
+# ===========================================================================
+# Component-constraint-dictionary merge ("mini_kruskal")
+# ===========================================================================
+# Instead of tentatively merging each round's candidates and then running a BFS
+# heaviest-edge cleanup to break violating paths (the old "current" merge), we
+# maintain a single dictionary
+#
+#     constraints : Dict[component_root -> set(component_root)]
+#
+# keyed by the *currently active* DSU roots.  ``constraints[A]`` is the set of
+# roots A may never merge with.  Symmetry (B in constraints[A] <=> A in
+# constraints[B]) and completeness (is_constrained(A, B) is True iff some point
+# in A and some point in B form a cannot-link pair) are preserved by folding the
+# loser's constraint set into the winner on every accepted union.  All checks
+# are O(1); candidates are processed lightest-first so any edge blocked by a
+# constraint is the heavier of the conflicting pair.
+
+
+@numba.njit(cache=NUMBA_CACHE)
+def _init_constraint_dict(cl_pair_u, cl_pair_v):
+    """Build the initial component-constraint dictionary.
+
+    At the start every point is its own component, so the dictionary is keyed by
+    point index.  For each undirected CL pair (u, v) we record the symmetric
+    membership ``v in constraints[u]`` and ``u in constraints[v]``.
+    """
+    constraints = Dict.empty(types.int64, _CL_SET_TYPE)
+    M = cl_pair_u.shape[0]
+    for k in range(M):
+        u = np.int64(cl_pair_u[k])
+        v = np.int64(cl_pair_v[k])
+        if u not in constraints:
+            constraints[u] = Dict.empty(types.int64, types.int8)
+        if v not in constraints:
+            constraints[v] = Dict.empty(types.int64, types.int8)
+        constraints[u][v] = np.int8(1)
+        constraints[v][u] = np.int8(1)
+    return constraints
+
+
+@numba.njit(inline="always", cache=NUMBA_CACHE)
+def _is_constrained(constraints, from_root, to_root):
+    """O(1) test: would merging ``from_root`` and ``to_root`` violate a CL pair?"""
+    if from_root not in constraints:
+        return False
+    return to_root in constraints[from_root]
+
+
+@numba.njit(cache=NUMBA_CACHE)
+def _update_constraints(constraints, from_root, to_root, new_root):
+    """Fold the losing component's constraints into the surviving root."""
+    old_root = to_root if new_root == from_root else from_root
+    if old_root not in constraints:
+        return  # loser had no constraints -- nothing to migrate
+
+    old_set = constraints[old_root]
+    del constraints[old_root]
+
+    if new_root not in constraints:
+        constraints[new_root] = Dict.empty(types.int64, types.int8)
+    new_set = constraints[new_root]
+
+    for peer in old_set:
+        if peer == new_root:
+            continue
+        if peer in constraints:
+            peer_set = constraints[peer]
+            if old_root in peer_set:
+                del peer_set[old_root]
+            peer_set[new_root] = np.int8(1)
+        new_set[peer] = np.int8(1)
+
+
+@numba.njit(cache=NUMBA_CACHE)
+def _merge_components_constraint_dict(
+    cand_src, cand_dst, cand_wt, n_cand,
+    disjoint_set, point_components, constraints, order_in,
+):
+    """CL-aware component merge driven by the constraint dictionary (mini_kruskal).
+
+    Replaces ``validate_and_prune_merges`` + ``_commit_edges_cl``.  No BFS, no
+    per-round forbidden-CSR rebuild for the merge decision -- every candidate is
+    admitted or rejected by an O(1) lookup.  Candidates are processed
+    lightest-first so the edge blocked by a constraint is the heavier of any
+    conflicting pair.  Pass an empty int64 ``order_in`` to have the lightest-first
+    ``argsort`` computed internally.
+    """
+    if order_in.shape[0] == 0 and n_cand > 0:
+        order = np.argsort(cand_wt[:n_cand])
+    else:
+        order = order_in
+
+    new_edges = np.empty((n_cand, 3), dtype=np.float64)
+    n_added = np.int32(0)
+
+    for oi in range(n_cand):
+        i = order[oi]
+        src = np.int32(cand_src[i])
+        dst = np.int32(cand_dst[i])
+
+        from_root = ds_find(disjoint_set, src)
+        to_root = ds_find(disjoint_set, dst)
+        if from_root == to_root:
+            continue
+
+        # O(1) preventive CL check -- no violation ever enters the MST.
+        if _is_constrained(constraints, np.int64(from_root), np.int64(to_root)):
+            continue
+
+        new_edges[n_added, 0] = np.float64(src)
+        new_edges[n_added, 1] = np.float64(dst)
+        new_edges[n_added, 2] = np.float64(cand_wt[i])
+        n_added += np.int32(1)
+
+        ds_union_by_rank(disjoint_set, from_root, to_root)
+        new_root = ds_find(disjoint_set, from_root)
+        _update_constraints(
+            constraints, np.int64(from_root), np.int64(to_root), np.int64(new_root)
+        )
+
+    # Refresh point_components after all unions this round.
+    for i in range(point_components.shape[0]):
+        point_components[i] = ds_find(disjoint_set, np.int32(i))
+
+    return new_edges[:n_added], n_added
+
+
 def parallel_boruvka_cl(
     tree,
     n_threads,
@@ -875,6 +1012,12 @@ def parallel_boruvka_cl(
         cl_indices, cl_indptr
     )
 
+    # mini_kruskal merge state: one maintained component-constraint dictionary
+    # (folded on every accepted union) plus a reusable empty order array that
+    # tells ``_merge_components_constraint_dict`` to sort candidates internally.
+    constraints = _init_constraint_dict(cl_pair_u, cl_pair_v)
+    _mk_order = np.empty(0, dtype=np.int64)
+
     # Reuse validation scratch arrays across rounds.
     max_adj = 2 * n
     _adj_head = np.full(n, -1, dtype=np.int32)
@@ -912,42 +1055,16 @@ def parallel_boruvka_cl(
             init_wt = init_wt[mask_init]
             n_init = int(mask_init.sum())
 
-        if n_init > 0 and M_pairs > 0:
-            surv_src, surv_dst, surv_wt, n_surviving = validate_and_prune_merges(
+        if n_init > 0:
+            new_edges, n_added = _merge_components_constraint_dict(
                 init_src,
                 init_dst,
                 init_wt,
                 n_init,
-                cl_indices,
-                cl_indptr,
-                point_components,
-                n,
-                _adj_head,
-                _adj_next,
-                _adj_edge_idx,
-                _bfs_queue,
-                _bfs_parent_edge,
-                _bfs_visited,
-                _temp_parent,
-            )
-        elif n_init > 0:
-            surv_src, surv_dst, surv_wt, n_surviving = (
-                init_src,
-                init_dst,
-                init_wt,
-                n_init,
-            )
-        else:
-            n_surviving = 0
-
-        if n_surviving > 0:
-            new_edges, n_added = _commit_edges_cl(
-                surv_src,
-                surv_dst,
-                surv_wt,
-                n_surviving,
                 components_disjoint_set,
                 point_components,
+                constraints,
+                _mk_order,
             )
             all_edges = new_edges[:n_added]
             n_components = n - n_added
@@ -1049,47 +1166,15 @@ def parallel_boruvka_cl(
                         continue
                 break
 
-        surv_src, surv_dst, surv_wt, n_surviving = validate_and_prune_merges(
+        new_edges, n_added = _merge_components_constraint_dict(
             cand_src,
             cand_dst,
             cand_wt,
             n_cand,
-            cl_indices,
-            cl_indptr,
-            point_components,
-            n,
-            _adj_head,
-            _adj_next,
-            _adj_edge_idx,
-            _bfs_queue,
-            _bfs_parent_edge,
-            _bfs_visited,
-            _temp_parent,
-        )
-
-        if n_surviving == 0:
-            if use_threshold_schedule:
-                (
-                    global_band_level_index,
-                    global_band_n_advances,
-                    global_band_threshold,
-                    advanced,
-                ) = _advance_global_band_state(
-                    thresholds=global_band_thresholds,
-                    level_index=global_band_level_index,
-                    n_advances=global_band_n_advances,
-                )
-                if advanced:
-                    continue
-            break
-
-        new_edges, n_added = _commit_edges_cl(
-            surv_src,
-            surv_dst,
-            surv_wt,
-            n_surviving,
             components_disjoint_set,
             point_components,
+            constraints,
+            _mk_order,
         )
 
         if n_added == 0:

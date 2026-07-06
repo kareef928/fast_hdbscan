@@ -716,63 +716,57 @@ def boruvka_mst_cl(graph, cl_indices, cl_indptr, band_fraction=np.inf, overwrite
                     n_in_band += 1
             n_cand = n_in_band
 
-        surv_src, surv_dst, surv_wt, n_surviving = validate_and_prune_merges(
-            cand_src,
-            cand_dst,
-            cand_wt,
-            n_cand,
-            cl_indices,
-            cl_indptr,
-            point_components,
-            n,
-            _adj_head,
-            _adj_next,
-            _adj_edge_idx,
-            _bfs_queue,
-            _bfs_parent_edge,
-            _bfs_visited,
-            _temp_parent,
-        )
-
-        if n_surviving == 0:
-            break
-
-        new_edges = np.empty((n_surviving, 3), dtype=np.float64)
+        # mini_kruskal merge (replaces merge-then-break): process this round's
+        # per-component candidates lightest-first and admit each with an O(log)
+        # forbidden-set check against the maintained per-component CL arrays
+        # (folded on every union).  Because the heavier of any conflicting pair
+        # is seen second -- after the lighter edge has folded its partner's
+        # forbidden set into the shared root -- the transitive violations the
+        # old BFS cleanup caught are rejected here by the same O(log) lookup.
+        order = np.argsort(cand_wt[:n_cand])
+        new_edges = np.empty((n_cand, 3), dtype=np.float64)
         n_added = 0
-        for i in range(n_surviving):
-            src = surv_src[i]
-            dst = surv_dst[i]
+        for oi in range(n_cand):
+            i = order[oi]
+            src = cand_src[i]
+            dst = cand_dst[i]
 
             root_src = ds_find(disjoint_set, src)
             root_dst = ds_find(disjoint_set, dst)
-            if root_src != root_dst:
-                new_edges[n_added, 0] = np.float64(src)
-                new_edges[n_added, 1] = np.float64(dst)
-                new_edges[n_added, 2] = np.float64(surv_wt[i])
-                n_added += 1
+            if root_src == root_dst:
+                continue
+            if _check_cl_conflict_sorted(
+                root_src, root_dst, cl_data, cl_arr_start, comp_csize_arr
+            ):
+                continue
 
-                if disjoint_set.rank[root_src] > disjoint_set.rank[root_dst]:
-                    new_root = root_src
-                    old_root = root_dst
-                elif disjoint_set.rank[root_src] < disjoint_set.rank[root_dst]:
-                    new_root = root_dst
-                    old_root = root_src
-                else:
-                    new_root = root_src
-                    old_root = root_dst
-                    disjoint_set.rank[new_root] += 1
-                disjoint_set.parent[old_root] = new_root
+            new_edges[n_added, 0] = np.float64(src)
+            new_edges[n_added, 1] = np.float64(dst)
+            new_edges[n_added, 2] = np.float64(cand_wt[i])
+            n_added += 1
 
-                _merge_cl_arrays(
-                    new_root,
-                    old_root,
-                    cl_data,
-                    cl_arr_start,
-                    cl_arr_capacity,
-                    comp_csize_arr,
-                    next_free_arr,
-                    cl_scratch,
-                )
+            if disjoint_set.rank[root_src] > disjoint_set.rank[root_dst]:
+                new_root = root_src
+                old_root = root_dst
+            elif disjoint_set.rank[root_src] < disjoint_set.rank[root_dst]:
+                new_root = root_dst
+                old_root = root_src
+            else:
+                new_root = root_src
+                old_root = root_dst
+                disjoint_set.rank[new_root] += 1
+            disjoint_set.parent[old_root] = new_root
+
+            _merge_cl_arrays(
+                new_root,
+                old_root,
+                cl_data,
+                cl_arr_start,
+                cl_arr_capacity,
+                comp_csize_arr,
+                next_free_arr,
+                cl_scratch,
+            )
 
         if n_added == 0:
             break
