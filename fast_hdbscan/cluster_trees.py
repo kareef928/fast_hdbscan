@@ -981,17 +981,21 @@ def get_cluster_label_vector(
                 cur_lambda = tree.lambda_val[tree.child == n]
                 if cluster_selection_epsilon > 0.0:
                     if cur_lambda >= 1 / cluster_selection_epsilon:
-                        result[n] = cluster_label_map[cluster]
+                        result[n] = cluster_label_map.get(cluster, -1)
                     else:
                         result[n] = -1
                 elif cur_lambda >= max_lambda:
-                    result[n] = cluster_label_map[cluster]
+                    result[n] = cluster_label_map.get(cluster, -1)
                 else:
                     result[n] = -1
             else:
                 result[n] = -1
         else:
-            result[n] = cluster_label_map[cluster]
+            # Defensive: a point can resolve (via the DSU over the condensed
+            # tree) to a node above the root that is not among the *selected*
+            # clusters -- e.g. with bridged/disconnected MSF forests. Treat such
+            # points as noise instead of raising a KeyError.
+            result[n] = cluster_label_map.get(cluster, -1)
 
     return result
 
